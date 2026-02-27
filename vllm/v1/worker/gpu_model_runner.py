@@ -3488,6 +3488,14 @@ class GPUModelRunner(
                 )
             )
 
+            
+            if isinstance(attn_metadata, dict):
+                part_metadata = attn_metadata[next(iter(attn_metadata))]
+            else:
+                part_metadata = attn_metadata
+            print("--------------------------------------")
+            print(f"{part_metadata=}")
+
             (
                 input_ids,
                 inputs_embeds,

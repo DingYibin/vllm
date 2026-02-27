@@ -226,10 +226,15 @@ class SpecDecodeBaseProposer:
             self.child_drafts_per_level.append(
                 num_drafts_per_level[level] // num_drafts_per_level[level - 1]
             )
+        print(f"{self.cu_drafts_per_level=}")
+        print(f"{self.child_drafts_per_level=}")
+
         # Precompute draft position offsets in flattened tree.
         self.tree_draft_pos_offsets = torch.arange(
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
+
+        print(f"{self.tree_draft_pos_offsets=}")
 
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
@@ -405,12 +410,12 @@ class SpecDecodeBaseProposer:
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
-            if not self.model_returns_tuple():
+            if not isinstance(ret_hidden_states, tuple):
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
-
+        print(f"{num_input_tokens=} {last_hidden_states.shape=}\n", end="", flush=True)
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
 
@@ -929,6 +934,8 @@ class SpecDecodeBaseProposer:
                 num_tokens
             )
             num_input_tokens = batch_desc.num_tokens
+
+            print(f"{level=} {num_input_tokens=}\n{per_layer_attn_metadata=}")
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -945,7 +952,7 @@ class SpecDecodeBaseProposer:
                     hidden_states=self.hidden_states[:num_input_tokens],
                     inputs_embeds=None,
                 )
-
+            print(f"tree {level=} {hidden_states.shape=}\n", end="", flush=True)
             # Get the output hidden states for the draft tokens.
             draft_hidden_states = hidden_states[:num_tokens].view(
                 batch_size, query_len, -1

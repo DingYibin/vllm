@@ -271,6 +271,23 @@ class SpeculativeConfig:
         if initial_architecture == "MistralLarge3ForCausalLM":
             hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
 
+        if hf_config.model_type in ("qwen2", ):
+            new_architecture = "Qwen2MTPModel"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": [new_architecture]}
+            )
+            hf_config.model_type = "mtp"
+
+        if hf_config.model_type in ("qwen3_moe", ):
+            new_architecture = "Qwen3MoEMTPModel"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": [new_architecture]}
+            )
+            hf_config.model_type = "mtp"
+
+
         return hf_config
 
     def __post_init__(self):
