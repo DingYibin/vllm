@@ -684,6 +684,8 @@ class GPUModelRunner(
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
+        self.batch_execution_and_padding_for_drafter: tuple[
+            CUDAGraphMode, BatchDescriptor, torch.Tensor | None] | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
@@ -1897,16 +1899,6 @@ class GPUModelRunner(
             else:
                 for _metadata in attn_metadata.values():
                     _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
-
-        if spec_decode_common_attn_metadata is not None and (
-            num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
-        ):
-            # Currently the drafter still only uses piecewise cudagraphs (and modifies
-            # the attention metadata in directly), and therefore does not want to use
-            # padded attention metadata.
-            spec_decode_common_attn_metadata = (
-                spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
-            )
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -3186,6 +3178,34 @@ class GPUModelRunner(
                 runtime_mode=str(cudagraph_mode),
             )
 
+        return self._record_batch_execution_and_padding(
+            cudagraph_mode,
+            batch_descriptor,
+            should_ubatch,
+            num_tokens_across_dp,
+            cudagraph_stats,
+        )
+
+    def _record_batch_execution_and_padding(
+        self,
+        cudagraph_mode,
+        batch_descriptor,
+        should_ubatch,
+        num_tokens_across_dp,
+        cudagraph_stats,
+    ) -> tuple[
+        CUDAGraphMode,
+        BatchDescriptor,
+        bool,
+        torch.Tensor | None,
+        CUDAGraphStat | None,
+    ]:
+        if self.num_spec_tokens:
+            self.batch_execution_and_padding_for_drafter = (
+                cudagraph_mode,
+                batch_descriptor,
+                num_tokens_across_dp,
+            )
         return (
             cudagraph_mode,
             batch_descriptor,
@@ -4902,6 +4922,7 @@ class GPUModelRunner(
                     use_cudagraphs = False
 
                 self.drafter.dummy_run(
+                    attn_metadata,
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,

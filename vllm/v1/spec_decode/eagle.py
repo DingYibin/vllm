@@ -9,13 +9,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
 )
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -308,7 +312,7 @@ class SpecDecodeBaseProposer:
         batch_size = common_attn_metadata.batch_size()
 
         if self.method == "eagle3":
-            assert isinstance(self.model, Eagle3LlamaForCausalLM)
+            # assert isinstance(self.model, Eagle3LlamaForCausalLM)
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
@@ -355,16 +359,24 @@ class SpecDecodeBaseProposer:
             assert draft_indexer_metadata is not None
             per_layer_attn_metadata[layer_name] = draft_indexer_metadata
 
-        num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
-        )
+        if self.runner is None or self.runner.batch_execution_and_padding_for_drafter is None:
+            num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
+                num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
+            )
 
-        cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
-            num_tokens_dp_padded
-        )
-        num_input_tokens = batch_desc.num_tokens
-        if num_tokens_across_dp is not None:
-            num_tokens_across_dp[self.dp_rank] = num_input_tokens
+            cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+                num_tokens_dp_padded
+            )
+            num_input_tokens = batch_desc.num_tokens
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp[self.dp_rank] = num_input_tokens
+        else:
+            (
+                cudagraph_runtime_mode,
+                batch_desc,
+                num_tokens_across_dp,
+            ) = self.runner.batch_execution_and_padding_for_drafter
+            num_input_tokens = batch_desc.num_tokens
 
         if self.pass_hidden_states_to_model:
             # target_hidden_states and self.hidden_states can have different
@@ -461,23 +473,37 @@ class SpecDecodeBaseProposer:
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
-        batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
-        )
+        if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            num_input_tokens = batch_size
+            batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
+                num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
+            )
 
-        cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
-            batch_size_dp_padded
-        )
-        input_batch_size = batch_desc.num_tokens
-        if batch_size_across_dp is not None:
-            batch_size_across_dp[self.dp_rank] = input_batch_size
+            cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+                batch_size_dp_padded
+            )
+            input_batch_size = batch_desc.num_tokens
+            if batch_size_across_dp is not None:
+                batch_size_across_dp[self.dp_rank] = input_batch_size
 
-        common_attn_metadata.num_actual_tokens = batch_size
-        common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-            self.token_arange_np[: batch_size + 1]
-        ).clone()
+            common_attn_metadata.num_actual_tokens = batch_size
+            common_attn_metadata.max_query_len = 1
+            common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
+            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[: batch_size + 1]
+            ).clone()
+
+        else:
+            batch_size_across_dp = num_tokens_across_dp
+
+            common_attn_metadata.max_query_len = 1
+            common_attn_metadata.query_start_loc[: batch_size + 1] = self.arange[: batch_size + 1]
+            common_attn_metadata.query_start_loc[batch_size + 1 :] = common_attn_metadata.query_start_loc[batch_size]
+            common_attn_metadata.query_start_loc_cpu[: batch_size + 1] = torch.from_numpy(
+                self.token_arange_np[: batch_size + 1]
+            )
+            common_attn_metadata.query_start_loc_cpu[batch_size + 1 :] = common_attn_metadata.query_start_loc_cpu[batch_size]
+
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -572,35 +598,35 @@ class SpecDecodeBaseProposer:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
             # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
+            self.input_ids[:batch_size] = input_ids[:batch_size]
             self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = hidden_states
+            self.hidden_states[:batch_size] = hidden_states[:batch_size]
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
                 input_ids = None
-                inputs_embeds = self.inputs_embeds[:input_batch_size]
+                inputs_embeds = self.inputs_embeds[:num_input_tokens]
             else:
-                input_ids = self.input_ids[:input_batch_size]
+                input_ids = self.input_ids[:num_input_tokens]
                 inputs_embeds = None
 
             # Run the model.
             model_kwargs = {
                 "input_ids": input_ids,
-                "positions": self._get_positions(input_batch_size),
+                "positions": self._get_positions(num_input_tokens),
                 "inputs_embeds": inputs_embeds,
             }
             if self.pass_hidden_states_to_model:
-                model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+                model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
 
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=input_batch_size,
+                num_tokens=num_input_tokens,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(
-                    input_batch_size, common_attn_metadata.slot_mapping
+                    num_input_tokens, common_attn_metadata.slot_mapping
                 ),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -1277,9 +1303,20 @@ class SpecDecodeBaseProposer:
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
 
+        # wrap the model with full cudagraph wrapper if needed.
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        assert cudagraph_mode is not None
+        if (
+            cudagraph_mode.has_full_cudagraphs()
+        ):
+            self.model = CUDAGraphWrapper(
+                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+            )
+
     @torch.inference_mode()
     def dummy_run(
         self,
+        attn_metadata,
         num_tokens: int,
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
@@ -1287,10 +1324,20 @@ class SpecDecodeBaseProposer:
     ) -> None:
         # FIXME: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
+        get_from_target = self.runner is not None and self.runner.batch_execution_and_padding_for_drafter is not None
+        if get_from_target:
+            (
+                cudagraph_runtime_mode,
+                batch_desc,
+                num_tokens_across_dp,
+            ) = self.runner.batch_execution_and_padding_for_drafter
+            num_input_tokens = batch_desc.num_tokens
         for fwd_idx in range(
             self.num_speculative_tokens if not is_graph_capturing else 1
         ):
-            if fwd_idx <= 1:
+            
+            if ((fwd_idx == 0 and not get_from_target)
+                 or (fwd_idx == 1 and cudagraph_runtime_mode == CUDAGraphMode.NONE)):
                 num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
                     num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
                 )
@@ -1316,7 +1363,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping_dict = slot_mappings or {}
 
             with set_forward_context(
-                None,
+                attn_metadata,
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
