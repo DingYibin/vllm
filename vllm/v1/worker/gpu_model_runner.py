@@ -593,6 +593,8 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        self.batch_execution_and_padding_for_drafter: tuple[
+            CUDAGraphMode, BatchDescriptor, torch.Tensor | None] | None = None
 
         # Flag to enable async DP sync with gloo (CPU) for speculative decoding.
         # Enabled when: use_async_scheduling=True, spec decode with Eagle, DP size > 1,
@@ -1834,7 +1836,7 @@ class GPUModelRunner(
 
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
-        ):
+        ) and self.speculative_config.disable_padded_drafter_batch:
             # Currently the drafter still only uses piecewise cudagraphs (and modifies
             # the attention metadata in directly), and therefore does not want to use
             # padded attention metadata.
@@ -2993,6 +2995,24 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+
+
+        return self._record_batch_execution_and_padding(
+            cudagraph_mode, batch_descriptor, ubatch_slices, num_tokens_across_dp
+        )
+
+    def _record_batch_execution_and_padding(
+        self,
+        cudagraph_mode, batch_descriptor, ubatch_slices, num_tokens_across_dp
+    ) -> tuple[
+        CUDAGraphMode, BatchDescriptor, UBatchSlices | None, torch.Tensor | None
+    ]:
+        if self.num_spec_tokens:
+            self.batch_execution_and_padding_for_drafter = (
+                cudagraph_mode,
+                batch_descriptor,
+                num_tokens_across_dp,
+            )
 
         return cudagraph_mode, batch_descriptor, ubatch_slices, num_tokens_across_dp
 
@@ -4270,6 +4290,7 @@ class GPUModelRunner(
                     use_cudagraphs = False
 
                 self.drafter.dummy_run(
+                    attn_metadata,
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
