@@ -635,6 +635,9 @@ class GPUModelRunner(
             self._dp_sync_issued = False
             # Cached DP sync result for use in _determine_batch_execution_and_padding
             self._dp_sync_result: torch.Tensor | None = None
+            # Device tensor for bs_to_padded_graph_size lookup (initialized in capture_model)
+            # This allows device-side cudagraph padding without D2H sync
+            self._bs_to_padded_graph_size_device: torch.Tensor | None = None
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -1227,6 +1230,20 @@ class GPUModelRunner(
             tensor = self._dp_sync_tensor_device
             tensor.zero_()
             tensor[0, dp_rank] = total_tokens_unpadded.to(torch.int32)
+
+            # Apply cudagraph padding using device-side lookup table
+            # This mirrors vllm_config.pad_for_cudagraph logic
+            # Use torch.where to avoid D2H sync
+            max_cudagraph_size = self._bs_to_padded_graph_size_device.shape[0] - 1
+            cudagraph_padded = self._bs_to_padded_graph_size_device[
+                torch.clamp(total_tokens_padded, 0, max_cudagraph_size)
+            ]
+            total_tokens_padded = torch.where(
+                total_tokens_padded <= max_cudagraph_size,
+                cudagraph_padded,
+                total_tokens_padded
+            )
+
             tensor[1, dp_rank] = total_tokens_padded.to(torch.int32)
             tensor[2, dp_rank] = should_attempt_ubatching_tensor
             tensor[3, dp_rank] = 1 if allow_dp_padding else 0
@@ -4710,6 +4727,14 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
             scope="local",
         )
+
+        # Initialize device-side bs_to_padded_graph_size tensor for async DP sync
+        if self._enable_async_dp_sync:
+            bs_to_padded = self.compilation_config.bs_to_padded_graph_size
+            self._bs_to_padded_graph_size_device = torch.tensor(
+                bs_to_padded, device=self.device, dtype=torch.int32
+            )
+
         return cuda_graph_size
 
     def _capture_cudagraphs(
