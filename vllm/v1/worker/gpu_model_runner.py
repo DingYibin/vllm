@@ -769,6 +769,10 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # For async scheduling with spec decode and DP: issue async DP sync
+        # at the beginning to overlap NCCL all_reduce with GPU sync.
+        self._issue_async_dp_sync(scheduler_output)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -868,16 +872,6 @@ class GPUModelRunner(
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
-
-        # For async scheduling with spec decode and DP: issue async DP sync
-        # before _get_valid_sampled_token_count to overlap NCCL all_reduce
-        # with GPU sync.
-        if self._enable_async_dp_sync:
-            # Get all scheduled request IDs and count from scheduler_output
-            # This includes both existing requests and new requests to be added
-            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-            num_reqs = len(req_ids)
-            self._issue_async_dp_sync(scheduler_output, num_reqs, req_ids)
 
         # Wait until valid_sampled_tokens_count is copied to cpu,
         # then use it to update actual num_computed_tokens of each request.
@@ -1104,8 +1098,6 @@ class GPUModelRunner(
     def _issue_async_dp_sync(
         self,
         scheduler_output: "SchedulerOutput",
-        num_reqs: int,
-        req_ids: list[str],
     ) -> None:
         """Issue async DP synchronization using gloo (CPU).
 
@@ -1114,11 +1106,12 @@ class GPUModelRunner(
 
         Args:
             scheduler_output: Scheduler output containing num_scheduled_tokens
-            num_reqs: Number of requests after condense
-            req_ids: Request IDs after condense (order matters)
         """
         if not self._enable_async_dp_sync:
             return
+
+        # Get all scheduled request IDs from scheduler_output
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
 
         # Reset state
         self._dp_sync_issued = False
@@ -1128,19 +1121,21 @@ class GPUModelRunner(
         dp_rank = self.parallel_config.data_parallel_rank
 
         # Compute num_tokens on CPU
+        # Filter out requests with 0 tokens (they won't be scheduled)
         total_tokens_unpadded = 0
+        num_reqs = 0
+        max_num_scheduled_tokens = 0
         for req_id in req_ids:
-            total_tokens_unpadded += scheduler_output.num_scheduled_tokens[req_id]
-
-        # Get num_spec_tokens per request and compute total adjustment
-        total_spec_tokens_to_subtract = 0
-        if self._draft_token_ids is None:
-            for req_id in req_ids:
-                spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-                total_spec_tokens_to_subtract += len(spec_tokens)
-
-        # Adjust for spec tokens
-        total_tokens_unpadded -= total_spec_tokens_to_subtract
+            tokens = scheduler_output.num_scheduled_tokens[req_id]
+            # Subtract spec tokens for async scheduling
+            if self._draft_token_ids is None:
+                spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
+                    req_id, [])
+                tokens -= len(spec_tokens)
+            if tokens > 0:
+                total_tokens_unpadded += tokens
+                num_reqs += 1
+                max_num_scheduled_tokens = max(max_num_scheduled_tokens, tokens)
 
         # Early return if no tokens to process
         if total_tokens_unpadded == 0:
@@ -1152,12 +1147,6 @@ class GPUModelRunner(
             total_tokens_padded = ((total_tokens_unpadded + tp_size - 1) // tp_size) * tp_size
         else:
             total_tokens_padded = total_tokens_unpadded
-
-        # Compute max_num_scheduled_tokens on CPU
-        max_num_scheduled_tokens = 0
-        for req_id in req_ids:
-            tokens = scheduler_output.num_scheduled_tokens[req_id]
-            max_num_scheduled_tokens = max(max_num_scheduled_tokens, tokens)
 
         # Compute uniform_decode on CPU
         uniform_decode = (
