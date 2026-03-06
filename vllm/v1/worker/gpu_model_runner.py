@@ -594,56 +594,24 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         )
 
-        # Flag to enable async DP sync with NCCL for speculative decoding.
+        # Flag to enable async DP sync with gloo (CPU) for speculative decoding.
         # Enabled when: use_async_scheduling=True, spec decode with Eagle, DP size > 1,
-        # and disable_nccl_for_dp_synchronization=False (must use NCCL, not gloo)
+        # and disable_nccl_for_dp_synchronization=True (uses gloo for CPU communication)
         self._enable_async_dp_sync = (
             self.use_async_scheduling
             and self.num_spec_tokens > 0
             and self.speculative_config is not None
             and self.speculative_config.use_eagle()
             and self.parallel_config.data_parallel_size > 1
-            and not self.parallel_config.disable_nccl_for_dp_synchronization
+            and self.parallel_config.disable_nccl_for_dp_synchronization
         )
 
-        # Flag to enable async DP sync in dummy_run after capture_model completes.
-        # Initialized to False, set to True in capture_model when _enable_async_dp_sync.
-        self._enable_dummy_async_dp_sync = False
-
-        # Device-side tensors and events for async DP sync with NCCL.
-        # This allows overlapping DP synchronization with GPU sync in _update_states.
-        if self._enable_async_dp_sync:
-            # Event to signal valid_sampled_token_count is ready on device
-            self.valid_sampled_token_count_device_event = torch.Event()
-            # Dedicated stream for async DP sync
-            self.dp_sync_stream = torch.cuda.Stream()
-            # Event to signal DP sync result is ready
-            self.dp_sync_result_event = torch.Event()
-            # Device tensor for DP all_reduce result
-            self._dp_sync_tensor_device: torch.Tensor | None = None
-            # CPU tensor for async D2H copy of DP sync result
-            self._dp_sync_tensor_cpu: torch.Tensor | None = None
-            # Device tensor for num_scheduled_tokens (for H2D async copy)
-            self._num_scheduled_tokens_device = torch.empty(
-                self.max_num_reqs, device=self.device, dtype=torch.int32
-            )
-            # Pinned CPU tensor for async H2D copy of num_scheduled_tokens
-            self._num_scheduled_tokens_cpu_pinned = torch.empty(
-                self.max_num_reqs, device="cpu", pin_memory=True, dtype=torch.int32
-            )
-            # Device tensor for valid_sampled_tokens_count (stored from prev step)
-            self._valid_sampled_tokens_count_device = torch.empty(
-                self.max_num_reqs, device=self.device, dtype=torch.int64
-            )
-            # Number of requests from prev step (for indexing valid_sampled_tokens_count)
-            self._prev_num_reqs: int = 0
-            # Flag indicating DP sync was issued
-            self._dp_sync_issued = False
-            # Cached DP sync result for use in _determine_batch_execution_and_padding
-            self._dp_sync_result: torch.Tensor | None = None
-            # Device tensor for bs_to_padded_graph_size lookup (initialized in capture_model)
-            # This allows device-side cudagraph padding without D2H sync
-            self._bs_to_padded_graph_size_device: torch.Tensor | None = None
+        # CPU tensor for DP sync result (using gloo for CPU communication)
+        self._dp_sync_tensor_cpu: torch.Tensor | None = None
+        # Flag indicating DP sync was issued
+        self._dp_sync_issued = False
+        # Cached DP sync result for use in _determine_batch_execution_and_padding
+        self._dp_sync_result: torch.Tensor | None = None
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -1139,10 +1107,10 @@ class GPUModelRunner(
         num_reqs: int,
         req_ids: list[str],
     ) -> None:
-        """Issue async DP synchronization on dedicated stream.
+        """Issue async DP synchronization using gloo (CPU).
 
-        This runs on dp_sync_stream and overlaps with _get_valid_sampled_token_count
-        on the default stream.
+        All input data is on CPU, so we can communicate directly without
+        waiting for GPU operations from the previous step.
 
         Args:
             scheduler_output: Scheduler output containing num_scheduled_tokens
@@ -1159,220 +1127,96 @@ class GPUModelRunner(
         dp_size = self.parallel_config.data_parallel_size
         dp_rank = self.parallel_config.data_parallel_rank
 
-        # Copy num_scheduled_tokens to pinned CPU tensor first (async preparation)
-        num_scheduled_tokens_cpu = self._num_scheduled_tokens_cpu_pinned
-        for i, req_id in enumerate(req_ids):
-            num_scheduled_tokens_cpu[i] = scheduler_output.num_scheduled_tokens[req_id]
+        # Compute num_tokens on CPU
+        total_tokens_unpadded = 0
+        for req_id in req_ids:
+            total_tokens_unpadded += scheduler_output.num_scheduled_tokens[req_id]
 
         # Get num_spec_tokens per request and compute total adjustment
-        # This mirrors the logic in _update_states (lines 1037-1039):
-        # if num_spec_tokens and self._draft_token_ids is None:
-        #     scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
         total_spec_tokens_to_subtract = 0
         if self._draft_token_ids is None:
             for req_id in req_ids:
                 spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
                 total_spec_tokens_to_subtract += len(spec_tokens)
 
-        with torch.cuda.stream(self.dp_sync_stream):
-            # Wait for valid_sampled_token_count to be ready on device
-            self.dp_sync_stream.wait_event(self.valid_sampled_token_count_device_event)
+        # Adjust for spec tokens
+        total_tokens_unpadded -= total_spec_tokens_to_subtract
 
-            # Async H2D copy of num_scheduled_tokens
-            num_scheduled_tokens_device = self._num_scheduled_tokens_device[:num_reqs]
-            num_scheduled_tokens_device.copy_(num_scheduled_tokens_cpu[:num_reqs], non_blocking=True)
+        # Early return if no tokens to process
+        if total_tokens_unpadded == 0:
+            return
 
-            # Compute SP padding on device
-            # Note: total_tokens_unpadded already accounts for spec token adjustment
-            # (mirrors scheduler_output.total_num_scheduled_tokens adjustment)
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            total_tokens_unpadded = num_scheduled_tokens_device.sum() - total_spec_tokens_to_subtract
-            if self.compilation_config.pass_config.enable_sp and tp_size > 1:
-                total_tokens_padded = ((total_tokens_unpadded + tp_size - 1) // tp_size) * tp_size
-            else:
-                total_tokens_padded = total_tokens_unpadded
+        # Compute SP padding on CPU
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
+            total_tokens_padded = ((total_tokens_unpadded + tp_size - 1) // tp_size) * tp_size
+        else:
+            total_tokens_padded = total_tokens_unpadded
 
-            # Compute max_num_scheduled_tokens on device
-            max_num_scheduled_tokens = num_scheduled_tokens_device.max()
+        # Compute max_num_scheduled_tokens on CPU
+        max_num_scheduled_tokens = 0
+        for req_id in req_ids:
+            tokens = scheduler_output.num_scheduled_tokens[req_id]
+            max_num_scheduled_tokens = max(max_num_scheduled_tokens, tokens)
 
-            # Compute uniform_decode on device
-            uniform_decode = (
-                max_num_scheduled_tokens == self.uniform_decode_query_len
-                and total_tokens_padded == max_num_scheduled_tokens * num_reqs
+        # Compute uniform_decode on CPU
+        uniform_decode = (
+            max_num_scheduled_tokens == self.uniform_decode_query_len
+            and total_tokens_padded == max_num_scheduled_tokens * num_reqs
+        )
+
+        # Determine if we should attempt DP padding
+        allow_dp_padding = (
+            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+
+        # Check if we should attempt microbatching
+        should_attempt_ubatching = False
+        if self.parallel_config.enable_dbo:
+            threshold = (
+                self.parallel_config.dbo_decode_token_threshold
+                if uniform_decode
+                else self.parallel_config.dbo_prefill_token_threshold
+            )
+            should_attempt_ubatching = total_tokens_unpadded >= threshold
+
+        # Allocate CPU tensor for all_reduce if needed
+        if self._dp_sync_tensor_cpu is None or self._dp_sync_tensor_cpu.size(1) != dp_size:
+            self._dp_sync_tensor_cpu = torch.zeros(
+                4, dp_size, device="cpu", dtype=torch.int32
             )
 
-            # Determine if we should attempt DP padding
-            allow_dp_padding = (
-                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            )
+        # Fill the tensor on CPU
+        tensor = self._dp_sync_tensor_cpu
+        tensor.zero_()
+        tensor[0, dp_rank] = total_tokens_unpadded
 
-            # Check if we should attempt microbatching - implement threshold check on device
-            # Default is 0 (False), same as coordinate_batch_across_dp
-            should_attempt_ubatching_tensor = torch.tensor(0, device=self.device, dtype=torch.int32)
-            if self.parallel_config.enable_dbo:
-                # Get thresholds from config and select based on uniform_decode (all on device)
-                decode_threshold = self.parallel_config.dbo_decode_token_threshold
-                prefill_threshold = self.parallel_config.dbo_prefill_token_threshold
-                # Use torch.where to avoid D2H sync when selecting threshold
-                threshold = torch.where(
-                    uniform_decode,
-                    torch.tensor(decode_threshold, device=self.device, dtype=torch.int32),
-                    torch.tensor(prefill_threshold, device=self.device, dtype=torch.int32)
-                )
-                should_attempt_ubatching_tensor = (total_tokens_unpadded >= threshold).int()
+        # Apply cudagraph padding on CPU
+        max_cudagraph_size = len(self.compilation_config.bs_to_padded_graph_size) - 1
+        if total_tokens_padded <= max_cudagraph_size:
+            total_tokens_padded = self.compilation_config.bs_to_padded_graph_size[total_tokens_padded]
 
-            # Allocate device tensor for all_reduce if needed
-            if self._dp_sync_tensor_device is None or self._dp_sync_tensor_device.size(1) != dp_size:
-                self._dp_sync_tensor_device = torch.zeros(
-                    4, dp_size, device=self.device, dtype=torch.int32
-                )
-                self._dp_sync_tensor_cpu = torch.zeros(
-                    4, dp_size, device="cpu", dtype=torch.int32
-                )
+        tensor[1, dp_rank] = total_tokens_padded
+        tensor[2, dp_rank] = 1 if should_attempt_ubatching else 0
+        tensor[3, dp_rank] = 1 if allow_dp_padding else 0
 
-            # Fill the tensor on device
-            tensor = self._dp_sync_tensor_device
-            tensor.zero_()
-            tensor[0, dp_rank] = total_tokens_unpadded.to(torch.int32)
-
-            # Apply cudagraph padding using device-side lookup table
-            # This mirrors vllm_config.pad_for_cudagraph logic
-            # Use torch.where to avoid D2H sync
-            max_cudagraph_size = self._bs_to_padded_graph_size_device.shape[0] - 1
-            cudagraph_padded = self._bs_to_padded_graph_size_device[
-                torch.clamp(total_tokens_padded, 0, max_cudagraph_size)
-            ]
-            total_tokens_padded = torch.where(
-                total_tokens_padded <= max_cudagraph_size,
-                cudagraph_padded,
-                total_tokens_padded
-            )
-
-            tensor[1, dp_rank] = total_tokens_padded.to(torch.int32)
-            tensor[2, dp_rank] = should_attempt_ubatching_tensor
-            tensor[3, dp_rank] = 1 if allow_dp_padding else 0
-
-            # Issue NCCL all_reduce
-            import torch.distributed as dist
-            from vllm.distributed.parallel_state import get_dp_group
-            dist.all_reduce(tensor, group=get_dp_group().device_group)
-
-            # Issue async D2H copy
-            self._dp_sync_tensor_cpu.copy_(tensor, non_blocking=True)
-
-            # Record event to signal result is ready
-            self.dp_sync_result_event.record()
+        # Issue gloo all_reduce on CPU
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_dp_group
+        dist.all_reduce(tensor, group=get_dp_group().cpu_group)
 
         self._dp_sync_issued = True
 
     def _get_dp_sync_result(self) -> torch.Tensor | None:
-        """Get the DP sync result after async copy completes.
+        """Get the DP sync result.
 
         This should be called in _determine_batch_execution_and_padding.
+        Since we use gloo (CPU) for communication, the result is already available.
         """
         if not self._dp_sync_issued or self._dp_sync_tensor_cpu is None:
             return None
 
-        # Wait for async D2H copy to complete
-        self.dp_sync_result_event.synchronize()
-
         return self._dp_sync_tensor_cpu
-
-    def _dummy_issue_async_dp_sync(
-        self,
-        num_tokens: int,
-        num_reqs: int,
-        uniform_decode: bool = False,
-    ) -> None:
-        """Issue async DP sync for dummy_run.
-
-        Unlike _issue_async_dp_sync, this doesn't wait for
-        valid_sampled_token_count_device_event since dummy_run has deterministic
-        token counts.
-
-        Args:
-            num_tokens: Number of tokens for the dummy run
-            num_reqs: Number of requests (typically min(num_tokens, max_num_reqs))
-            uniform_decode: Whether this is a uniform decode batch
-        """
-        if not self._enable_async_dp_sync:
-            return
-
-        # Reset state
-        self._dp_sync_issued = False
-        self._dp_sync_result = None
-
-        dp_size = self.parallel_config.data_parallel_size
-        dp_rank = self.parallel_config.data_parallel_rank
-
-        with torch.cuda.stream(self.dp_sync_stream):
-            # Compute SP padding on device
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            total_tokens_unpadded = torch.tensor(
-                num_tokens, device=self.device, dtype=torch.int32
-            )
-            if self.compilation_config.pass_config.enable_sp and tp_size > 1:
-                total_tokens_padded = ((total_tokens_unpadded + tp_size - 1) // tp_size) * tp_size
-            else:
-                total_tokens_padded = total_tokens_unpadded
-
-            # Apply cudagraph padding using device-side lookup table
-            max_cudagraph_size = self._bs_to_padded_graph_size_device.shape[0] - 1
-            cudagraph_padded = self._bs_to_padded_graph_size_device[
-                torch.clamp(total_tokens_padded, 0, max_cudagraph_size)
-            ]
-            total_tokens_padded = torch.where(
-                total_tokens_padded <= max_cudagraph_size,
-                cudagraph_padded,
-                total_tokens_padded
-            )
-
-            # Determine if we should attempt DP padding
-            allow_dp_padding = (
-                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            )
-
-            # Check if we should attempt microbatching
-            should_attempt_ubatching_tensor = torch.tensor(0, device=self.device, dtype=torch.int32)
-            if self.parallel_config.enable_dbo:
-                decode_threshold = self.parallel_config.dbo_decode_token_threshold
-                prefill_threshold = self.parallel_config.dbo_prefill_token_threshold
-                threshold = torch.where(
-                    uniform_decode,
-                    torch.tensor(decode_threshold, device=self.device, dtype=torch.int32),
-                    torch.tensor(prefill_threshold, device=self.device, dtype=torch.int32)
-                )
-                should_attempt_ubatching_tensor = (total_tokens_unpadded >= threshold).int()
-
-            # Allocate device tensor for all_reduce if needed
-            if self._dp_sync_tensor_device is None or self._dp_sync_tensor_device.size(1) != dp_size:
-                self._dp_sync_tensor_device = torch.zeros(
-                    4, dp_size, device=self.device, dtype=torch.int32
-                )
-                self._dp_sync_tensor_cpu = torch.zeros(
-                    4, dp_size, device="cpu", dtype=torch.int32
-                )
-
-            # Fill the tensor on device
-            tensor = self._dp_sync_tensor_device
-            tensor.zero_()
-            tensor[0, dp_rank] = total_tokens_unpadded
-            tensor[1, dp_rank] = total_tokens_padded.to(torch.int32)
-            tensor[2, dp_rank] = should_attempt_ubatching_tensor
-            tensor[3, dp_rank] = 1 if allow_dp_padding else 0
-
-            # Issue NCCL all_reduce
-            import torch.distributed as dist
-            from vllm.distributed.parallel_state import get_dp_group
-            dist.all_reduce(tensor, group=get_dp_group().device_group)
-
-            # Issue async D2H copy
-            self._dp_sync_tensor_cpu.copy_(tensor, non_blocking=True)
-
-            # Record event to signal result is ready
-            self.dp_sync_result_event.record()
-
-        self._dp_sync_issued = True
 
     def _extract_mm_kwargs(
         self,
@@ -3612,23 +3456,6 @@ class GPUModelRunner(
             counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
 
-        # For async DP sync: save device-side valid_sampled_tokens_count
-        # and record event to signal data is ready
-        if self._enable_async_dp_sync:
-            # Copy valid_sampled_tokens_count to our device tensor for later use
-            num_reqs = valid_sampled_tokens_count.shape[0]
-            self._valid_sampled_tokens_count_device[:num_reqs].copy_(
-                valid_sampled_tokens_count, non_blocking=True
-            )
-            self._prev_num_reqs = num_reqs
-            # Record event to signal device-side data is ready
-            self.valid_sampled_token_count_device_event.record(default_stream)
-
-            # Wait for DP sync to complete before drafter continues
-            # This ensures NCCL communication doesn't get out of order
-            # with subsequent operations (e.g., MOE communication)
-            default_stream.wait_event(self.dp_sync_result_event)
-
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
@@ -4295,15 +4122,6 @@ class GPUModelRunner(
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
-        # Issue async DP sync for dummy_run to match the communication pattern
-        # of _issue_async_dp_sync in _update_states
-        if self._enable_dummy_async_dp_sync:
-            self._dummy_issue_async_dp_sync(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                uniform_decode=uniform_decode,
-            )
-
         _cudagraph_mode, batch_desc, ubatch_slices, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
@@ -4449,15 +4267,6 @@ class GPUModelRunner(
                 hidden_states = outputs
 
             if self.speculative_config and self.speculative_config.use_eagle():
-                # For async DP sync: record and wait events similar to
-                # _copy_valid_sampled_token_count in normal flow
-                if self._enable_dummy_async_dp_sync:
-                    default_stream = torch.cuda.current_stream()
-                    # Record event to signal device-side data is ready
-                    self.valid_sampled_token_count_device_event.record(default_stream)
-                    # Wait for DP sync to complete before drafter continues
-                    default_stream.wait_event(self.dp_sync_result_event)
-
                 assert isinstance(self.drafter, EagleProposer)
                 use_cudagraphs = (
                     cudagraph_runtime_mode.has_mode(CUDAGraphMode.PIECEWISE)
@@ -4845,15 +4654,6 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
             scope="local",
         )
-
-        # Initialize device-side bs_to_padded_graph_size tensor for async DP sync
-        if self._enable_async_dp_sync:
-            bs_to_padded = self.compilation_config.bs_to_padded_graph_size
-            self._bs_to_padded_graph_size_device = torch.tensor(
-                bs_to_padded, device=self.device, dtype=torch.int32
-            )
-            # Enable async DP sync in dummy_run after capture completes
-            self._enable_dummy_async_dp_sync = True
 
         return cuda_graph_size
 
