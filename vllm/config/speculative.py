@@ -119,6 +119,9 @@ class SpeculativeConfig:
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
     """
+    speculative_num_children_per_level: int | None = Field(default=None, ge=1)
+    speculative_num_level: int | None = Field(default=None, ge=1)
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -498,6 +501,19 @@ class SpeculativeConfig:
                             f" must be divisible by {n_predict=}"
                         )
 
+                if (self.speculative_num_children_per_level is not None
+                    and self.speculative_num_level is not None):
+                    speculative_token_tree = []
+                    now_level = [()]
+                    for i in range(self.speculative_num_level):
+                        now_level = [item + (j,) for item in now_level for j in range(self.speculative_num_children_per_level)]
+                        speculative_token_tree.extend(now_level)
+                    
+                    self.speculative_token_tree = str(speculative_token_tree)
+                else:
+                    self.speculative_num_children_per_level = None
+                    self.speculative_num_level = None
+                print(f"{self.speculative_token_tree=}")
                 if self.speculative_token_tree is None:
                     # Generate chain of tokens.
                     self.speculative_token_tree = str(

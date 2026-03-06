@@ -428,3 +428,12 @@ class TreeAttentionImpl(AttentionImpl):
                 v_descale=layer._v_scale.expand(descale_shape),
             )
         return output
+
+
+def move_kv_cache_kernel(
+        
+):
+    pass
+
+def move_kv_cache(kv_cache, slot_mapping, slot_target):
+    key_cache, value_cache = kv_cache.unbind(0)

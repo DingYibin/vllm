@@ -3521,7 +3521,7 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
-
+        print(f"{input_ids=}\n{positions=}")
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -3668,7 +3668,7 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
+        print(f"{logits.argmax(dim=-1)=}\n{sampler_output.sampled_token_ids=}")
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -6071,7 +6071,8 @@ class GPUModelRunner(
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
-
+            if self.speculative_config.speculative_num_level is not None:
+                self.drafter.all_kv_caches = kv_caches
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
             if self.cross_layers_kv_cache is not None:

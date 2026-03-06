@@ -228,6 +228,21 @@ class SpecDecodeBaseProposer:
             )
         print(f"{self.cu_drafts_per_level=}")
         print(f"{self.child_drafts_per_level=}")
+        self.tree_father = None
+        self.all_kv_caches = None
+        if self.speculative_config.speculative_num_level is not None:
+            self.tree_father = [-1]
+            last_start = 0
+            last_end = 1
+            for i in range(self.speculative_config.speculative_num_level):
+                for j in range(last_start, last_end):
+                    self.tree_father.extend([j] * self.speculative_config.speculative_num_children_per_level)
+                last_start = last_end
+                last_end = len(self.tree_father)
+            self.tree_father = torch.tensor(self.tree_father, dtype=torch.int32, device=device)
+        print(f"{self.tree_father=}")
+
+            
 
         # Precompute draft position offsets in flattened tree.
         self.tree_draft_pos_offsets = torch.arange(
@@ -935,7 +950,7 @@ class SpecDecodeBaseProposer:
             )
             num_input_tokens = batch_desc.num_tokens
 
-            print(f"{level=} {num_input_tokens=}\n{per_layer_attn_metadata=}")
+            # print(f"{level=} {num_input_tokens=}\n{per_layer_attn_metadata=}")
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -979,6 +994,7 @@ class SpecDecodeBaseProposer:
             # Update the # drafts counters for the next tree level.
             level_num_drafts = self.cu_drafts_per_level[level + 1] - total_num_drafts
             total_num_drafts = self.cu_drafts_per_level[level + 1]
+        print(f"{draft_token_ids_list=}")
         return draft_token_ids_list
 
     def prepare_inputs(
