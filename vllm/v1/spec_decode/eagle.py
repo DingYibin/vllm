@@ -1214,9 +1214,7 @@ class EagleProposer:
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
-                if cudagraphs_enabled
-                else CUDAGraphMode.NONE,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
             ):
                 if self.supports_mm_inputs:
                     input_ids = None
