@@ -51,6 +51,7 @@ class SpecDecodeMetadata:
 
     # === Tree-mode specific fields ===
 
+    input_ids: torch.Tensor | None = None
     # Tree structure definition: list of paths from root to each node.
     # Example: [(0,), (1,), (0, 0), (0, 1), (1, 0), (1, 1)]
     # represents a 2-branch, 2-level tree:
