@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import (
     CompilationMode,
