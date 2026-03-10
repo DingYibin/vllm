@@ -1266,12 +1266,12 @@ class GPUModelRunner(
         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
 
         cudagraph_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
-            num_tokens=num_tokens_padded,
+            num_tokens=total_tokens_padded,
             has_lora=has_lora,
             uniform_decode=uniform_decode,
             disable_full=has_encoder_output,
         )
-        num_tokens_padded = batch_descriptor.num_tokens
+        total_tokens_padded = batch_descriptor.num_tokens
 
         # Allocate CPU tensor for all_reduce if needed
         if self._early_gloo_dp_sync_tensor_cpu is None or self._early_gloo_dp_sync_tensor_cpu.size(1) != dp_size:
@@ -1283,12 +1283,6 @@ class GPUModelRunner(
         tensor = self._early_gloo_dp_sync_tensor_cpu
         tensor.zero_()
         tensor[0, dp_rank] = total_tokens_unpadded
-
-        # Apply cudagraph padding on CPU
-        max_cudagraph_size = len(self.compilation_config.bs_to_padded_graph_size) - 1
-        if total_tokens_padded <= max_cudagraph_size:
-            total_tokens_padded = self.compilation_config.bs_to_padded_graph_size[total_tokens_padded]
-
         tensor[1, dp_rank] = total_tokens_padded
         tensor[2, dp_rank] = 1 if should_attempt_ubatching else 0
         tensor[3, dp_rank] = 1 if allow_dp_padding else 0
@@ -3188,10 +3182,6 @@ class GPUModelRunner(
                     _post_process_dp_padding,
                     _post_process_ubatch,
                 )
-                from vllm.v1.worker.ubatch_utils import (
-                    _pad_out_ubatch_slices,
-                    maybe_create_ubatch_slices,
-                )
 
                 should_dp_pad = bool(torch.all(dp_sync_tensor[3] == 1).item())
                 should_ubatch = _post_process_ubatch(
@@ -3210,21 +3200,6 @@ class GPUModelRunner(
                 num_tokens_across_dp = _post_process_dp_padding(dp_sync_tensor, should_dp_pad)
                 synced_cudagraph_mode = _post_process_cudagraph_mode(dp_sync_tensor)
 
-                if should_ubatch:
-                    assert num_tokens_across_dp is not None
-                    num_tokens_padded_for_ubatch = int(num_tokens_across_dp[0].item())
-                    token_split_point = num_tokens_padded_for_ubatch // 2
-                    ubatch_slices, _ = maybe_create_ubatch_slices(
-                        should_ubatch=True,
-                        num_scheduled_tokens=num_scheduled_tokens_np,
-                        num_tokens_padded=num_tokens_padded_for_ubatch,
-                        num_reqs_padded=num_reqs,
-                        num_ubatches=self.parallel_config.num_ubatches,
-                        split_point=token_split_point,
-                    )
-                    ubatch_slices = _pad_out_ubatch_slices(
-                        ubatch_slices, num_tokens_padded_for_ubatch, num_reqs
-                    )
             else:
                 # Fallback to original path when no cached result
                 should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
