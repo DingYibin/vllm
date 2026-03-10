@@ -680,6 +680,27 @@ class GPUModelRunner(
                     pin_memory=self.pin_memory,
                 )
 
+        self.batch_execution_and_padding_for_drafter: tuple[
+            CUDAGraphMode, BatchDescriptor, torch.Tensor | None] | None = None
+
+        # Flag to enable early DP sync with gloo (CPU) for speculative decoding.
+        # Enabled when: enable_early_gloo_for_dp_synchronization=True, spec decode
+        # with Eagle, DP size > 1, and disable_nccl_for_dp_synchronization=True
+        self._enable_early_gloo_dp_sync = (
+            self.parallel_config.enable_early_gloo_for_dp_synchronization
+            and self.use_async_scheduling
+            and self.num_spec_tokens > 0
+            and self.speculative_config is not None
+            and self.speculative_config.use_eagle()
+            and self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.disable_nccl_for_dp_synchronization
+        )
+
+        # CPU tensor for DP sync result (using gloo for CPU communication)
+        self._early_gloo_dp_sync_tensor_cpu: torch.Tensor | None = None
+        # Flag indicating DP sync was issued
+        self._early_gloo_dp_sync_issued = False
+
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
@@ -844,6 +865,10 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # For async scheduling with spec decode and DP: issue async DP sync
+        # at the beginning to overlap NCCL all_reduce with GPU sync.
+        self._issue_early_gloo_dp_sync(scheduler_output)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1158,6 +1183,126 @@ class GPUModelRunner(
             mm_kwargs_combined.update(mm_kwargs_group)
 
         return mm_kwargs_combined
+
+    def _issue_early_gloo_dp_sync(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Issue early DP synchronization using gloo (CPU).
+
+        All input data is on CPU, so we can communicate directly without
+        waiting for GPU operations from the previous step.
+
+        Args:
+            scheduler_output: Scheduler output containing num_scheduled_tokens
+        """
+        if not self._enable_early_gloo_dp_sync:
+            return
+
+        # Get all scheduled request IDs from scheduler_output
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+
+        # Reset state
+        self._early_gloo_dp_sync_issued = False
+
+        dp_size = self.parallel_config.data_parallel_size
+        dp_rank = self.parallel_config.data_parallel_rank
+
+        # Compute num_tokens on CPU
+        # Filter out requests with 0 tokens (they won't be scheduled)
+        total_tokens_unpadded = 0
+        num_reqs = 0
+        max_num_scheduled_tokens = 0
+        for req_id in req_ids:
+            tokens = scheduler_output.num_scheduled_tokens[req_id]
+            # Subtract spec tokens for async scheduling
+            if self._draft_token_ids is None:
+                spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
+                    req_id, [])
+                tokens -= len(spec_tokens)
+            if tokens > 0:
+                total_tokens_unpadded += tokens
+                num_reqs += 1
+                max_num_scheduled_tokens = max(max_num_scheduled_tokens, tokens)
+
+        # Early return if no tokens to process
+        if total_tokens_unpadded == 0:
+            return
+
+        # Compute SP padding on CPU
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
+            total_tokens_padded = ((total_tokens_unpadded + tp_size - 1) // tp_size) * tp_size
+        else:
+            total_tokens_padded = total_tokens_unpadded
+
+        # Compute uniform_decode on CPU
+        uniform_decode = (
+            max_num_scheduled_tokens == self.uniform_decode_query_len
+            and total_tokens_padded == max_num_scheduled_tokens * num_reqs
+        )
+
+        # Determine if we should attempt DP padding
+        allow_dp_padding = (
+            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+
+        # Check if we should attempt microbatching
+        should_attempt_ubatching = False
+        if self.parallel_config.enable_dbo:
+            threshold = (
+                self.parallel_config.dbo_decode_token_threshold
+                if uniform_decode
+                else self.parallel_config.dbo_prefill_token_threshold
+            )
+            should_attempt_ubatching = total_tokens_unpadded >= threshold
+
+        # Determine cudagraph_mode by mimicking cudagraph_dispatcher.dispatch
+        # Check if cudagraph is disabled or tokens exceed max capture size
+        if (self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+                or total_tokens_padded > self.compilation_config.max_cudagraph_capture_size):
+            cudagraph_mode_value = CUDAGraphMode.NONE.value
+        else:
+            cudagraph_mode_value = self.compilation_config.cudagraph_mode.value
+
+        # Allocate CPU tensor for all_reduce if needed
+        if self._early_gloo_dp_sync_tensor_cpu is None or self._early_gloo_dp_sync_tensor_cpu.size(1) != dp_size:
+            self._early_gloo_dp_sync_tensor_cpu = torch.zeros(
+                5, dp_size, device="cpu", dtype=torch.int32
+            )
+
+        # Fill the tensor on CPU
+        tensor = self._early_gloo_dp_sync_tensor_cpu
+        tensor.zero_()
+        tensor[0, dp_rank] = total_tokens_unpadded
+
+        # Apply cudagraph padding on CPU
+        max_cudagraph_size = len(self.compilation_config.bs_to_padded_graph_size) - 1
+        if total_tokens_padded <= max_cudagraph_size:
+            total_tokens_padded = self.compilation_config.bs_to_padded_graph_size[total_tokens_padded]
+
+        tensor[1, dp_rank] = total_tokens_padded
+        tensor[2, dp_rank] = 1 if should_attempt_ubatching else 0
+        tensor[3, dp_rank] = 1 if allow_dp_padding else 0
+        tensor[4, dp_rank] = cudagraph_mode_value
+
+        # Issue gloo all_reduce on CPU
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_dp_group
+        dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+
+        self._early_gloo_dp_sync_issued = True
+
+    def _get_early_gloo_dp_sync_result(self) -> torch.Tensor | None:
+        """Get the early gloo DP sync result.
+
+        This should be called in _determine_batch_execution_and_padding.
+        Since we use gloo (CPU) for communication, the result is already available.
+        """
+        if not self._early_gloo_dp_sync_issued or self._early_gloo_dp_sync_tensor_cpu is None:
+            return None
+
+        return self._early_gloo_dp_sync_tensor_cpu
 
     def _dummy_mm_kwargs(self, num_seqs: int) -> BatchedTensorInputs:
         if not self.is_multimodal_raw_input_only_model:
@@ -1801,7 +1946,7 @@ class GPUModelRunner(
 
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
-        ):
+        ) and self.speculative_config.disable_padded_drafter_batch:
             # Currently the drafter still only uses piecewise cudagraphs (and modifies
             # the attention metadata in directly), and therefore does not want to use
             # padded attention metadata.
@@ -3026,18 +3171,65 @@ class GPUModelRunner(
                 self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             )
 
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    parallel_config=self.parallel_config,
-                    allow_microbatching=allow_microbatching,
-                    allow_dp_padding=allow_dp_padding,
-                    num_tokens_padded=num_tokens_padded,
-                    uniform_decode=uniform_decode,
-                    num_scheduled_tokens_per_request=num_scheduled_tokens_np,
-                    cudagraph_mode=cudagraph_mode.value,
+            # Check if we have cached DP sync result from _update_states
+            dp_sync_tensor = self._get_early_gloo_dp_sync_result()
+            synced_cudagraph_mode = cudagraph_mode.value
+            if dp_sync_tensor is not None:
+                # Use the cached result from async scheduling path
+                from vllm.v1.worker.dp_utils import (
+                    _post_process_dp_padding,
+                    _post_process_ubatch,
                 )
-            )
+                from vllm.v1.worker.ubatch_utils import (
+                    _pad_out_ubatch_slices,
+                    maybe_create_ubatch_slices,
+                )
+
+                should_dp_pad = bool(torch.all(dp_sync_tensor[3] == 1).item())
+                should_ubatch = _post_process_ubatch(
+                    dp_sync_tensor, self.parallel_config.num_ubatches
+                )
+
+                if should_ubatch and not should_dp_pad:
+                    logger.debug_once(
+                        "Microbatching has been triggered and requires DP padding. "
+                        "Enabling DP padding even though it has been explicitly "
+                        "disabled.",
+                        scope="global",
+                    )
+                    should_dp_pad = True
+
+                num_tokens_across_dp = _post_process_dp_padding(dp_sync_tensor, should_dp_pad)
+
+                if should_ubatch:
+                    assert num_tokens_across_dp is not None
+                    num_tokens_padded_for_ubatch = int(num_tokens_across_dp[0].item())
+                    token_split_point = num_tokens_padded_for_ubatch // 2
+                    ubatch_slices, _ = maybe_create_ubatch_slices(
+                        should_ubatch=True,
+                        num_scheduled_tokens=num_scheduled_tokens_np,
+                        num_tokens_padded=num_tokens_padded_for_ubatch,
+                        num_reqs_padded=num_reqs,
+                        num_ubatches=self.parallel_config.num_ubatches,
+                        split_point=token_split_point,
+                    )
+                    ubatch_slices = _pad_out_ubatch_slices(
+                        ubatch_slices, num_tokens_padded_for_ubatch, num_reqs
+                    )
+            else:
+                # Fallback to original path when no cached result
+                should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                    coordinate_batch_across_dp(
+                        num_tokens_unpadded=num_tokens,
+                        parallel_config=self.parallel_config,
+                        allow_microbatching=allow_microbatching,
+                        allow_dp_padding=allow_dp_padding,
+                        num_tokens_padded=num_tokens_padded,
+                        uniform_decode=uniform_decode,
+                        num_scheduled_tokens_per_request=num_scheduled_tokens_np,
+                        cudagraph_mode=cudagraph_mode.value,
+                    )
+                )
 
             # Extract DP-synced values
             if num_tokens_across_dp is not None:
@@ -3061,6 +3253,10 @@ class GPUModelRunner(
                 runtime_mode=str(cudagraph_mode),
             )
 
+        self._record_batch_execution_and_padding(
+            cudagraph_mode, batch_descriptor, num_tokens_across_dp
+        )
+
         return (
             cudagraph_mode,
             batch_descriptor,
@@ -3068,6 +3264,24 @@ class GPUModelRunner(
             num_tokens_across_dp,
             cudagraph_stats,
         )
+
+    def _record_batch_execution_and_padding(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> None:
+        """Record batch execution and padding info for the drafter model.
+
+        This is used to share batch information between the runner and drafter
+        to avoid redundant DP padding calculations.
+        """
+        if self.num_spec_tokens:
+            self.batch_execution_and_padding_for_drafter = (
+                cudagraph_mode,
+                batch_descriptor,
+                num_tokens_across_dp,
+            )
 
     def _register_layerwise_nvtx_hooks(self) -> None:
         """
@@ -4495,7 +4709,8 @@ class GPUModelRunner(
                     use_cudagraphs = False
 
                 self.drafter.dummy_run(
-                    num_tokens,
+                    attn_metadata,
+                    num_tokens_padded,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                 )
