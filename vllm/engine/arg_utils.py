@@ -413,6 +413,9 @@ class EngineArgs:
     disable_nccl_for_dp_synchronization: bool = (
         ParallelConfig.disable_nccl_for_dp_synchronization
     )
+    enable_early_gloo_for_dp_synchronization: bool = (
+        ParallelConfig.enable_early_gloo_for_dp_synchronization
+    )
     eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
     enable_eplb: bool = ParallelConfig.enable_eplb
     expert_placement_strategy: ExpertPlacementStrategy = (
@@ -837,6 +840,10 @@ class EngineArgs:
         parallel_group.add_argument(
             "--disable-nccl-for-dp-synchronization",
             **parallel_kwargs["disable_nccl_for_dp_synchronization"],
+        )
+        parallel_group.add_argument(
+            "--enable-early-gloo-for-dp-synchronization",
+            **parallel_kwargs["enable_early_gloo_for_dp_synchronization"],
         )
         parallel_group.add_argument("--enable-eplb", **parallel_kwargs["enable_eplb"])
         parallel_group.add_argument("--eplb-config", **parallel_kwargs["eplb_config"])
@@ -1599,6 +1606,7 @@ class EngineArgs:
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,
             dbo_prefill_token_threshold=self.dbo_prefill_token_threshold,
             disable_nccl_for_dp_synchronization=self.disable_nccl_for_dp_synchronization,
+            enable_early_gloo_for_dp_synchronization=self.enable_early_gloo_for_dp_synchronization,
             enable_eplb=self.enable_eplb,
             eplb_config=self.eplb_config,
             expert_placement_strategy=self.expert_placement_strategy,

@@ -596,11 +596,12 @@ class GPUModelRunner(
         self.batch_execution_and_padding_for_drafter: tuple[
             CUDAGraphMode, BatchDescriptor, torch.Tensor | None] | None = None
 
-        # Flag to enable async DP sync with gloo (CPU) for speculative decoding.
-        # Enabled when: use_async_scheduling=True, spec decode with Eagle, DP size > 1,
-        # and disable_nccl_for_dp_synchronization=True (uses gloo for CPU communication)
-        self._enable_async_dp_sync = (
-            self.use_async_scheduling
+        # Flag to enable early DP sync with gloo (CPU) for speculative decoding.
+        # Enabled when: enable_early_gloo_for_dp_synchronization=True, spec decode
+        # with Eagle, DP size > 1, and disable_nccl_for_dp_synchronization=True
+        self._enable_early_gloo_dp_sync = (
+            self.parallel_config.enable_early_gloo_for_dp_synchronization
+            and self.use_async_scheduling
             and self.num_spec_tokens > 0
             and self.speculative_config is not None
             and self.speculative_config.use_eagle()
@@ -609,11 +610,9 @@ class GPUModelRunner(
         )
 
         # CPU tensor for DP sync result (using gloo for CPU communication)
-        self._dp_sync_tensor_cpu: torch.Tensor | None = None
+        self._early_gloo_dp_sync_tensor_cpu: torch.Tensor | None = None
         # Flag indicating DP sync was issued
-        self._dp_sync_issued = False
-        # Cached DP sync result for use in _determine_batch_execution_and_padding
-        self._dp_sync_result: torch.Tensor | None = None
+        self._early_gloo_dp_sync_issued = False
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -773,7 +772,7 @@ class GPUModelRunner(
         """
         # For async scheduling with spec decode and DP: issue async DP sync
         # at the beginning to overlap NCCL all_reduce with GPU sync.
-        self._issue_async_dp_sync(scheduler_output)
+        self._issue_early_gloo_dp_sync(scheduler_output)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -1097,11 +1096,11 @@ class GPUModelRunner(
             req_state.mm_features,
         )
 
-    def _issue_async_dp_sync(
+    def _issue_early_gloo_dp_sync(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Issue async DP synchronization using gloo (CPU).
+        """Issue early DP synchronization using gloo (CPU).
 
         All input data is on CPU, so we can communicate directly without
         waiting for GPU operations from the previous step.
@@ -1109,15 +1108,14 @@ class GPUModelRunner(
         Args:
             scheduler_output: Scheduler output containing num_scheduled_tokens
         """
-        if not self._enable_async_dp_sync:
+        if not self._enable_early_gloo_dp_sync:
             return
 
         # Get all scheduled request IDs from scheduler_output
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
 
         # Reset state
-        self._dp_sync_issued = False
-        self._dp_sync_result = None
+        self._early_gloo_dp_sync_issued = False
 
         dp_size = self.parallel_config.data_parallel_size
         dp_rank = self.parallel_config.data_parallel_rank
@@ -1172,13 +1170,13 @@ class GPUModelRunner(
             should_attempt_ubatching = total_tokens_unpadded >= threshold
 
         # Allocate CPU tensor for all_reduce if needed
-        if self._dp_sync_tensor_cpu is None or self._dp_sync_tensor_cpu.size(1) != dp_size:
-            self._dp_sync_tensor_cpu = torch.zeros(
+        if self._early_gloo_dp_sync_tensor_cpu is None or self._early_gloo_dp_sync_tensor_cpu.size(1) != dp_size:
+            self._early_gloo_dp_sync_tensor_cpu = torch.zeros(
                 4, dp_size, device="cpu", dtype=torch.int32
             )
 
         # Fill the tensor on CPU
-        tensor = self._dp_sync_tensor_cpu
+        tensor = self._early_gloo_dp_sync_tensor_cpu
         tensor.zero_()
         tensor[0, dp_rank] = total_tokens_unpadded
 
@@ -1196,18 +1194,18 @@ class GPUModelRunner(
         from vllm.distributed.parallel_state import get_dp_group
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
 
-        self._dp_sync_issued = True
+        self._early_gloo_dp_sync_issued = True
 
-    def _get_dp_sync_result(self) -> torch.Tensor | None:
-        """Get the DP sync result.
+    def _get_early_gloo_dp_sync_result(self) -> torch.Tensor | None:
+        """Get the early gloo DP sync result.
 
         This should be called in _determine_batch_execution_and_padding.
         Since we use gloo (CPU) for communication, the result is already available.
         """
-        if not self._dp_sync_issued or self._dp_sync_tensor_cpu is None:
+        if not self._early_gloo_dp_sync_issued or self._early_gloo_dp_sync_tensor_cpu is None:
             return None
 
-        return self._dp_sync_tensor_cpu
+        return self._early_gloo_dp_sync_tensor_cpu
 
     def _extract_mm_kwargs(
         self,
@@ -2937,7 +2935,7 @@ class GPUModelRunner(
             )
 
             # Check if we have cached DP sync result from _update_states
-            dp_sync_tensor = self._get_dp_sync_result()
+            dp_sync_tensor = self._get_early_gloo_dp_sync_result()
             if dp_sync_tensor is not None:
                 # Use the cached result from async scheduling path
                 from vllm.v1.worker.dp_utils import (
