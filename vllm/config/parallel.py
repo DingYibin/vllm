@@ -168,6 +168,12 @@ class ParallelConfig:
     """Forces the dp synchronization logic in vllm/v1/worker/dp_utils.py 
     to use Gloo instead of NCCL for its all reduce"""
 
+    enable_early_gloo_for_dp_synchronization: bool = False
+    """Enables early DP synchronization using Gloo (CPU communication) for
+    speculative decoding with Eagle. When enabled, the DP sync is issued
+    asynchronously before model execution and waited on later, overlapping
+    computation with communication to improve throughput."""
+
     ray_workers_use_nsight: bool = False
     """Whether to profile Ray workers with nsight, see https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler."""
 
