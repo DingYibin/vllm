@@ -695,6 +695,12 @@ class GPUModelRunner(
             and self.parallel_config.data_parallel_size > 1
             and self.parallel_config.disable_nccl_for_dp_synchronization
         )
+        if self._enable_early_gloo_dp_sync and self.cascade_attn_enabled:
+            logger.warning_once(
+                "Early Gloo DP sync is not compatible with cascade attention. "
+                "Cascade attention is only supported by the FlashAttention backend "
+                "in vllm/v1/attention/backends/flash_attn.py. "
+                "Do not enable early Gloo DP sync if cascade attention is enabled.")
 
         # CPU tensor for DP sync result (using gloo for CPU communication)
         self._early_gloo_dp_sync_tensor_cpu: torch.Tensor | None = None
