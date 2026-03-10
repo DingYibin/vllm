@@ -1257,13 +1257,21 @@ class GPUModelRunner(
             )
             should_attempt_ubatching = total_tokens_unpadded >= threshold
 
-        # Determine cudagraph_mode by mimicking cudagraph_dispatcher.dispatch
-        # Check if cudagraph is disabled or tokens exceed max capture size
-        if (self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-                or total_tokens_padded > self.compilation_config.max_cudagraph_capture_size):
-            cudagraph_mode_value = CUDAGraphMode.NONE.value
-        else:
-            cudagraph_mode_value = self.compilation_config.cudagraph_mode.value
+        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+
+        has_encoder_output = (
+            self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        )
+
+        has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
+
+        cudagraph_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
+            num_tokens=num_tokens_padded,
+            has_lora=has_lora,
+            uniform_decode=uniform_decode,
+            disable_full=has_encoder_output,
+        )
+        num_tokens_padded = batch_descriptor.num_tokens
 
         # Allocate CPU tensor for all_reduce if needed
         if self._early_gloo_dp_sync_tensor_cpu is None or self._early_gloo_dp_sync_tensor_cpu.size(1) != dp_size:
@@ -1284,7 +1292,7 @@ class GPUModelRunner(
         tensor[1, dp_rank] = total_tokens_padded
         tensor[2, dp_rank] = 1 if should_attempt_ubatching else 0
         tensor[3, dp_rank] = 1 if allow_dp_padding else 0
-        tensor[4, dp_rank] = cudagraph_mode_value
+        tensor[4, dp_rank] = cudagraph_mode.value
 
         # Issue gloo all_reduce on CPU
         import torch.distributed as dist
