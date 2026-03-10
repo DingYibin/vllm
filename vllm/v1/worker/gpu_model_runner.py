@@ -3173,10 +3173,10 @@ class GPUModelRunner(
 
             # Check if we have cached DP sync result from _update_states
             dp_sync_tensor = self._get_early_gloo_dp_sync_result()
-            synced_cudagraph_mode = cudagraph_mode.value
             if dp_sync_tensor is not None:
                 # Use the cached result from async scheduling path
                 from vllm.v1.worker.dp_utils import (
+                    _post_process_cudagraph_mode,
                     _post_process_dp_padding,
                     _post_process_ubatch,
                 )
@@ -3200,6 +3200,7 @@ class GPUModelRunner(
                     should_dp_pad = True
 
                 num_tokens_across_dp = _post_process_dp_padding(dp_sync_tensor, should_dp_pad)
+                synced_cudagraph_mode = _post_process_cudagraph_mode(dp_sync_tensor)
 
                 if should_ubatch:
                     assert num_tokens_across_dp is not None
