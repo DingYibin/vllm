@@ -4291,7 +4291,7 @@ class GPUModelRunner(
 
                 self.drafter.dummy_run(
                     attn_metadata,
-                    num_tokens,
+                    num_tokens_padded,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                 )

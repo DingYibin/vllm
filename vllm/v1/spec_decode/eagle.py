@@ -654,6 +654,7 @@ class EagleProposer:
         are included as inputs to the speculator, with the rejected tokens
         used as padding and filtered out later by `token_indices_to_sample`.
         """
+        num_actual_reqs = len(spec_decode_metadata.cu_num_draft_tokens)
         num_reqs = common_attn_metadata.num_reqs
         device = valid_sampled_tokens_count.device
 
@@ -692,7 +693,7 @@ class EagleProposer:
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
 
-        return spec_common_attn_metadata, token_indices_to_sample
+        return spec_common_attn_metadata, token_indices_to_sample[:num_actual_reqs]
 
     def propose_tree(
         self,
