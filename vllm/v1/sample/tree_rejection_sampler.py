@@ -94,45 +94,41 @@ class TreeSimpleValidator(RejectionSampler):
         )
 
         # Perform tree-based rejection sampling
-        output_token_ids = tree_simple_validate(
+        output_token_ids, final_slots_mapping = tree_simple_validate(
             metadata.input_ids,
             sampled_token_ids,
             cu_num_sampled_tokens,
-            metadata.max_spec_len + 1,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_logits,
-            bonus_token_ids,
-            sampling_metadata,
             metadata.tree_father,
-            metadata.tree_choices,
-            metadata.num_tree_nodes,
+            sampling_metadata.slots_mapping,
+            metadata.max_spec_len + 1,
         )
 
         logprobs_tensors = None
+        # TODO: Add logprobs computation for tree-based rejection sampling
+        # The implementation should:
+        # 1. Gather logits for accepted tokens based on final_slots_mapping
+        # 2. Compute logprobs using sampler.compute_logprobs()
+        # 3. Use sampler.gather_logprobs() to get top-k logprobs for each token
+        # 4. Filter out rejected tokens (marked with -1) in the output
+        # Note: This requires handling tree structure where rejected branches
+        # need to be properly filtered from the logprobs output
         if sampling_metadata.max_num_logprobs is not None:
-            # For logprobs, use raw logits for target if not processed mode
-            raw_target_logits = raw_logits[metadata.target_logits_indices]
-            logprobs_tensors = self._get_logprobs_tensors(
-                sampling_metadata.max_num_logprobs,
-                metadata,
-                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
-                bonus_sampler_output.logprobs_tensors.logprobs,
-                output_token_ids,
-            )
+            # TODO: Implement _get_logprobs_tensors for tree mode
+            # logprobs_tensors = self._get_logprobs_tensors(
+            #     sampling_metadata.max_num_logprobs,
+            #     metadata,
+            #     logits,
+            #     processed_logits,
+            #     output_token_ids,
+            #     final_slots_mapping,
+            # )
+            pass
 
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+            final_slots_mapping=final_slots_mapping,
         )
-
-def tree_simple_validate(
-    input_ids,
-    sampled_token_ids,
-    cu_num_sampled_tokens,
-    max_sampled_len,
-) -> torch.Tensor:
-    pass
 
 def sample_all_tokens(
     num_draft_tokens: list[int],
@@ -218,3 +214,154 @@ def apply_sampling_constraints(
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
     return apply_top_k_top_p(logits, top_k, top_p)
+
+def tree_simple_validate(
+    input_ids,
+    sampled_token_ids,
+    cu_num_sampled_tokens,
+    tree_father,
+    slots_mapping,
+    max_sampled_len,
+) -> torch.Tensor:
+    device = input_ids.device
+    batch_size = cu_num_sampled_tokens.shape[0]
+    num_tokens_range = torch.zeros(batch_size + 1,
+                                   dtype=cu_num_sampled_tokens.dtype,
+                                   device=device)
+    num_tokens_range[1:] = cu_num_sampled_tokens
+
+    grid = (batch_size,)
+
+    output_ids = torch.full(
+        (batch_size, max_sampled_len), -1,
+        dtype=input_ids.dtype, device=device,
+    )
+    final_slots_mapping = torch.full_like(slots_mapping, -1)
+
+    tree_simple_validate_kernel[grid](
+        output_ids,
+        input_ids,
+        sampled_token_ids,
+        num_tokens_range,
+        tree_father,
+        slots_mapping,
+        final_slots_mapping,
+        max_sampled_len,
+    )
+
+    return output_ids, final_slots_mapping
+
+@triton.jit(do_not_specialize=["max_sampled_len"])
+def tree_simple_validate_kernel(
+    output_ids_ptr,  # [batch_size, max_sampled_len] - Output buffer for accepted token IDs
+    input_ids_ptr,  # [num_tokens] - Input token IDs (original draft tokens to be validated)
+    sampled_token_ids_ptr,  # [num_tokens] - Sampled token IDs from target model
+    num_tokens_range_ptr,  # [batch_size + 1] - Cumulative token counts, [start_idx, end_idx) per request
+    tree_father_ptr,  # [num_tokens] - Parent index for each token (-1 for root/last confirmed token)
+    slots_mapping_ptr,  # [num_tokens] - Slot mapping for each token position
+    final_slots_mapping_ptr,  # [batch_size, max_sampled_len] - Output slot mapping for accepted tokens
+    max_sampled_len: tl.constexpr,  # Maximum number of tokens per request (compile-time constant)
+):
+    """Triton kernel for tree-based rejection sampling.
+
+    This kernel validates draft tokens following a tree structure where:
+    - Each node represents a draft token
+    - Parent-child relationships define valid token sequences
+    - A token is accepted only if both its parent is accepted AND
+      input_id matches the parent's sampled token
+
+    The kernel finds the longest accepted path through the tree and outputs
+    the accepted tokens along with their slot mappings.
+
+    Algorithm:
+    1. Load token range and tree structure for this request
+    2. Compare each node's input_id with its parent's sampled_token_id
+    3. Compute acceptance status: root always accepted, others need parent accepted + match
+    4. Calculate path length ending at each node
+    5. Find the longest accepted path
+    6. Backtrack from the end of longest path to root, building output
+    7. Store accepted token IDs and slot mappings
+
+    Args:
+        output_ids_ptr: Output tensor [batch_size, max_sampled_len] for accepted token IDs
+        input_ids_ptr: Input token IDs that were supposed to be sampled
+        sampled_token_ids_ptr: Actually sampled token IDs from target model
+        num_tokens_range_ptr: Cumulative token counts, num_tokens_range_ptr[i] gives start index
+        tree_father_ptr: Parent index for each token defining the tree structure
+        slots_mapping_ptr: Current slot mapping for each token
+        final_slots_mapping_ptr: Output slot mapping for accepted tokens only
+        max_sampled_len: Maximum tokens per request (compile-time constant)
+    """
+    # Get the request index this program instance handles
+    req_idx = tl.program_id(0)
+
+    # Load token range [start_idx, end_idx) for this request
+    start_idx = tl.load(num_tokens_range_ptr + req_idx)
+    end_idx = tl.load(num_tokens_range_ptr + req_idx + 1)
+    num_tokens = end_idx - start_idx
+
+    # Create index range for batch loading all tokens of this request
+    offset = tl.arange(start_idx, end_idx)
+
+    # Load tree structure: parent index for each token
+    parents = tl.load(tree_father_ptr + offset)
+
+    # Load input token IDs (original draft tokens)
+    input_ids = tl.load(input_ids_ptr + offset)
+
+    # Load sampled token IDs from target model
+    sampled_tokens = tl.load(sampled_token_ids_ptr + offset)
+
+    # Load parent's sampled token for validation
+    # For root node (parent < 0), use input_ids[0] as placeholder (root always accepted)
+    parent_forward_tokens = tl.load(sampled_token_ids_ptr + start_idx + parents,
+                                    mask=parents >= 0, other=input_ids[0])
+
+    # Check acceptance: input_id must match parent's sampled token
+    # Root node (parents=0) automatically matches since parent_forward_tokens[0] = input_ids[0]
+    accepted = input_ids == parent_forward_tokens
+
+    # accepted_len[i] stores the length of accepted path ending at node i
+    accepted_len = tl.zeros((num_tokens,), dtype=tl.int32)
+    accepted_len[0] = 1  # Root is always accepted with path length 1
+
+    # Track the longest accepted path length and its ending position
+    max_len = 1
+    max_end = 0
+
+    # Iterate through all non-root tokens to compute accepted path lengths
+    for i in range(1, num_tokens):
+        p = parents[i]  # Get parent index of node i
+        if accepted_len[p] > 0 and accepted[i]:
+            # Parent accepted and current node matches: extend path by 1
+            accepted_len[i] = accepted_len[p] + 1
+            # Update longest path if this one is longer
+            if accepted_len[i] > max_len:
+                max_end = i
+                max_len = accepted_len[i]
+        else:
+            # Parent rejected or current node mismatch: path length is 0
+            accepted_len[i] = 0
+
+    # Start backtracking from the end of the longest accepted path
+    now_pos = max_end
+
+    # Load slot mappings
+    slots_mapping = tl.load(slots_mapping_ptr + offset)
+
+    # Initialize output buffers with -1 (indicating unused positions)
+    final_slots_mapping = tl.full((num_tokens,), -1, dtype=tl.int32)
+    output_ids = tl.full((num_tokens,), -1, dtype=tl.int32)
+
+    # Backtrack from end of longest path to root, filling output buffers
+    # Path goes root-to-leaf, so output positions are 0 to max_len-1
+    for i in range(max_len - 1, -1, -1):
+        final_slots_mapping[i] = slots_mapping[now_pos]
+        output_ids[i] = sampled_tokens[now_pos]
+        now_pos = parents[now_pos]  # Move to parent
+
+    # Write output token IDs to the corresponding request row
+    tl.store(output_ids_ptr + req_idx * max_sampled_len + offset - start_idx, output_ids)
+
+    # Write slot mappings to output buffer
+    tl.store(final_slots_mapping_ptr + offset, final_slots_mapping) 
