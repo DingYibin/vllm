@@ -99,7 +99,7 @@ class TreeSimpleValidator(RejectionSampler):
             sampled_token_ids,
             cu_num_sampled_tokens,
             metadata.tree_father,
-            sampling_metadata.slots_mapping,
+            sampling_metadata.slot_mapping,
             metadata.max_spec_len + 1,
         )
 

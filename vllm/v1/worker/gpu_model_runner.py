@@ -690,7 +690,7 @@ class GPUModelRunner(
 
         self.printed = False
         self.slots_mapping_map = None
-        self.slots_mapping = None
+        self.slot_mapping = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1596,10 +1596,10 @@ class GPUModelRunner(
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
         attn_metadata: PerLayerAttnMetadata = {}
-        self.slots_mapping = {}
+        self.slot_mapping = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
-            self.slots_mapping = [dict() for _ in range(len(ubatch_slices))]
+            self.slot_mapping = [dict() for _ in range(len(ubatch_slices))]
 
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
@@ -1748,15 +1748,15 @@ class GPUModelRunner(
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
-                slots_mapping_dict = self.slots_mapping
+                slots_mapping_dict = self.slot_mapping
             else:
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
-                slots_mapping_dict = self.slots_mapping[ubid]
+                slots_mapping_dict = self.slot_mapping[ubid]
 
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
-                slots_mapping_dict[layer_name] = attn_metadata_i.slots_mapping
+                slots_mapping_dict[layer_name] = attn_metadata_i.slot_mapping
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
