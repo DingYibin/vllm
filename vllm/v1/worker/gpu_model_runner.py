@@ -114,6 +114,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
+from vllm.v1.attention.ops.triton_reorder_kv_cache import reorder_kv_cache
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -147,6 +148,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.tree_rejection_sampler import TreeSimpleValidator
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -455,6 +457,7 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+            self.tree_validator = TreeSimpleValidator(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -684,6 +687,10 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+        self.printed = False
+        self.slots_mapping_map = None
+        self.slots_mapping = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1589,8 +1596,10 @@ class GPUModelRunner(
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
         attn_metadata: PerLayerAttnMetadata = {}
+        self.slots_mapping = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
+            self.slots_mapping = [dict() for _ in range(len(ubatch_slices))]
 
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
@@ -1739,12 +1748,15 @@ class GPUModelRunner(
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
+                slots_mapping_dict = self.slots_mapping
             else:
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
+                slots_mapping_dict = self.slots_mapping[ubid]
 
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
+                slots_mapping_dict[layer_name] = attn_metadata_i.slots_mapping
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -2744,13 +2756,20 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+        if spec_decode_metadata.is_tree_mode:
+            sampler_output = self.tree_validator(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
+        else:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _bookkeeping_sync(
@@ -5759,3 +5778,11 @@ class GPUModelRunner(
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
+
+    def reorder_kv_caches(self, keep_flag, ) -> None:
+        if self.slots_mapping_map is None:
+            return
+        for layer_name in self.slot_mappings:
+            kv_cache = self.kv_caches[layer_name]
+            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slots_mapping_map)
+        self.slots_mapping_map = None

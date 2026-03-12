@@ -465,6 +465,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "MedusaModel": ("medusa", "Medusa"),
     "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
+    "Qwen3MoEMTPModel": ("qwen3_moe_mtp", "Qwen3MoEMTP"),
     # Temporarily disabled.
     # # TODO(woosuk): Re-enable this once the MLP Speculator is supported in V1.
     # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),

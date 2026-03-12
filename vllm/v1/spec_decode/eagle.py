@@ -211,10 +211,30 @@ class EagleProposer:
             self.child_drafts_per_level.append(
                 num_drafts_per_level[level] // num_drafts_per_level[level - 1]
             )
+        print(f"{self.cu_drafts_per_level=}")
+        print(f"{self.child_drafts_per_level=}")
+        self.tree_father = None
+        self.all_kv_caches = None
+        if self.speculative_config.speculative_num_level is not None:
+            self.tree_father = [-1]
+            last_start = 0
+            last_end = 1
+            for i in range(self.speculative_config.speculative_num_level):
+                for j in range(last_start, last_end):
+                    self.tree_father.extend([j] * self.speculative_config.speculative_num_children_per_level)
+                last_start = last_end
+                last_end = len(self.tree_father)
+            self.tree_father = torch.tensor(self.tree_father, dtype=torch.int32, device=device)
+        print(f"{self.tree_father=}")
+
+            
+
         # Precompute draft position offsets in flattened tree.
         self.tree_draft_pos_offsets = torch.arange(
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
+
+        print(f"{self.tree_draft_pos_offsets=}")
 
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
@@ -341,7 +361,7 @@ class EagleProposer:
                 hidden_states=self.hidden_states[:num_input_tokens],
                 inputs_embeds=inputs_embeds,
             )
-            if self.method == "mtp":
+            if not isinstance(ret_hidden_states, tuple):
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
             else:
