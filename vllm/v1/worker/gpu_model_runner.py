@@ -118,6 +118,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.triton_reorder_kv_cache import reorder_kv_cache
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -152,6 +153,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.tree_rejection_sampler import TreeSimpleValidator
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -478,6 +480,7 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+            self.tree_validator = TreeSimpleValidator(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -708,6 +711,9 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
+
+        self.printed = False
+        self.slots_mapping_map = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -2866,12 +2872,20 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        if spec_decode_metadata.is_tree_mode:
+            sampler_output = self.tree_validator(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
+        else:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _bookkeeping_sync(
@@ -3288,11 +3302,14 @@ class GPUModelRunner(
         }
 
         slot_mappings_by_layer: dict[str, torch.Tensor] = {}
+        
         for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             slot_mapping = slot_mappings_by_gid[gid]
             for layer_name in kv_cache_group.layer_names:
+                if not self.printed:
+                    print(f"{layer_name=}\n", end="", flush=True)
                 slot_mappings_by_layer[layer_name] = slot_mapping
-
+        self.printed = True
         if ubatch_slices is not None:
             result: list[dict[str, torch.Tensor]] = []
             for ubatch in ubatch_slices:
@@ -3669,6 +3686,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
         print(f"{logits.argmax(dim=-1)=}\n{sampler_output.sampled_token_ids=}")
+        self.slots_mapping_map = sampler_output.slots_mapping_map
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -6252,6 +6270,13 @@ class GPUModelRunner(
                     stats.encoder_forward_time += per_request_time
                     stats.num_encoder_calls += 1
 
+    def reorder_kv_caches(self, slot_mappings: dict[str, torch.Tensor]) -> None:
+        if self.slots_mapping_map is None:
+            return
+        for layer_name in slot_mappings:
+            kv_cache = self.kv_caches[layer_name]
+            reorder_kv_cache(kv_cache[0], kv_cache[1], slot_mappings[layer_name], self.slots_mapping_map)
+        self.slots_mapping_map = None
 
 @dataclass
 class EncoderTimingStats:

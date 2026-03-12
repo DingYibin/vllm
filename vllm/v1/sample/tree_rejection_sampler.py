@@ -94,7 +94,7 @@ class TreeSimpleValidator(RejectionSampler):
         )
 
         # Perform tree-based rejection sampling
-        output_token_ids, final_slots_mapping = tree_simple_validate(
+        output_token_ids, slots_mapping_map = tree_simple_validate(
             metadata.input_ids,
             sampled_token_ids,
             cu_num_sampled_tokens,
@@ -127,7 +127,7 @@ class TreeSimpleValidator(RejectionSampler):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
-            final_slots_mapping=final_slots_mapping,
+            slots_mapping_map=slots_mapping_map,
         )
 
 def sample_all_tokens(
@@ -220,79 +220,89 @@ def tree_simple_validate(
     sampled_token_ids,
     cu_num_sampled_tokens,
     tree_father,
-    slots_mapping,
     max_sampled_len,
 ) -> torch.Tensor:
+    """Perform tree-based rejection sampling via Triton kernel.
+
+    This function prepares input tensors and launches the kernel for each
+    request in the batch.
+
+    Args:
+        input_ids: [num_tokens] Input token IDs (original draft tokens)
+        sampled_token_ids: [num_tokens] Sampled token IDs from target model
+        cu_num_sampled_tokens: [batch_size] Cumulative token counts per request
+        tree_father: [num_tokens] Parent index for each token
+        max_sampled_len: Maximum number of tokens per request
+
+    Returns:
+        Tuple of (output_ids, slots_mapping_map):
+        - output_ids: [batch_size, max_sampled_len] Accepted token IDs
+        - slots_mapping_map: [num_tokens] Slot mapping for accepted tokens
+    """
     device = input_ids.device
     batch_size = cu_num_sampled_tokens.shape[0]
+
+    # Build token range array: [start_idx for each request]
+    # num_tokens_range[i] = starting index of tokens for request i
     num_tokens_range = torch.zeros(batch_size + 1,
                                    dtype=cu_num_sampled_tokens.dtype,
                                    device=device)
     num_tokens_range[1:] = cu_num_sampled_tokens
 
+    # Launch one kernel instance per request
     grid = (batch_size,)
 
+    # Allocate output buffer for accepted token IDs
     output_ids = torch.full(
         (batch_size, max_sampled_len), -1,
         dtype=input_ids.dtype, device=device,
     )
-    final_slots_mapping = torch.full_like(slots_mapping, -1)
+    # Allocate slot mapping buffer
+    slots_mapping_map = torch.full_like(input_ids, -1)
 
+    # Launch kernel
     tree_simple_validate_kernel[grid](
         output_ids,
         input_ids,
         sampled_token_ids,
         num_tokens_range,
         tree_father,
-        slots_mapping,
-        final_slots_mapping,
+        slots_mapping_map,
         max_sampled_len,
     )
 
-    return output_ids, final_slots_mapping
+    return output_ids, slots_mapping_map
 
 @triton.jit(do_not_specialize=["max_sampled_len"])
 def tree_simple_validate_kernel(
-    output_ids_ptr,  # [batch_size, max_sampled_len] - Output buffer for accepted token IDs
-    input_ids_ptr,  # [num_tokens] - Input token IDs (original draft tokens to be validated)
-    sampled_token_ids_ptr,  # [num_tokens] - Sampled token IDs from target model
-    num_tokens_range_ptr,  # [batch_size + 1] - Cumulative token counts, [start_idx, end_idx) per request
-    tree_father_ptr,  # [num_tokens] - Parent index for each token (-1 for root/last confirmed token)
-    slots_mapping_ptr,  # [num_tokens] - Slot mapping for each token position
-    final_slots_mapping_ptr,  # [batch_size, max_sampled_len] - Output slot mapping for accepted tokens
-    max_sampled_len: tl.constexpr,  # Maximum number of tokens per request (compile-time constant)
+    output_ids_ptr,  # [batch_size, max_sampled_len] Output buffer for accepted token IDs
+    input_ids_ptr,  # [num_tokens] Input token IDs (original draft tokens to validate)
+    sampled_token_ids_ptr,  # [num_tokens] Sampled token IDs from target model
+    num_tokens_range_ptr,  # [batch_size + 1] Cumulative token counts, start index per request
+    tree_father_ptr,  # [num_tokens] Parent index for each token (-1 for root)
+    slots_mapping_map_ptr,  # [num_tokens] Output slot mapping for accepted tokens
+    max_sampled_len: tl.constexpr,  # Max tokens per request (compile-time constant)
 ):
     """Triton kernel for tree-based rejection sampling.
 
-    This kernel validates draft tokens following a tree structure where:
-    - Each node represents a draft token
-    - Parent-child relationships define valid token sequences
-    - A token is accepted only if both its parent is accepted AND
-      input_id matches the parent's sampled token
+    This kernel validates draft tokens following a tree structure:
+    - Each node represents a draft token with a parent-child relationship
+    - A token is accepted only if its parent is accepted AND input_id matches
+      the parent's sampled token
+    - The kernel finds the longest accepted path and outputs those tokens
 
-    The kernel finds the longest accepted path through the tree and outputs
-    the accepted tokens along with their slot mappings.
-
-    Algorithm:
-    1. Load token range and tree structure for this request
-    2. Compare each node's input_id with its parent's sampled_token_id
-    3. Compute acceptance status: root always accepted, others need parent accepted + match
-    4. Calculate path length ending at each node
-    5. Find the longest accepted path
-    6. Backtrack from the end of longest path to root, building output
-    7. Store accepted token IDs and slot mappings
+    Each program instance processes one request independently.
 
     Args:
-        output_ids_ptr: Output tensor [batch_size, max_sampled_len] for accepted token IDs
+        output_ids_ptr: Output [batch_size, max_sampled_len] for accepted token IDs
         input_ids_ptr: Input token IDs that were supposed to be sampled
         sampled_token_ids_ptr: Actually sampled token IDs from target model
-        num_tokens_range_ptr: Cumulative token counts, num_tokens_range_ptr[i] gives start index
-        tree_father_ptr: Parent index for each token defining the tree structure
-        slots_mapping_ptr: Current slot mapping for each token
-        final_slots_mapping_ptr: Output slot mapping for accepted tokens only
+        num_tokens_range_ptr: Cumulative token counts, num_tokens_range_ptr[i] = start index
+        tree_father_ptr: Parent index for each token defining tree structure
+        slots_mapping_map_ptr: Output slot mapping for accepted tokens
         max_sampled_len: Maximum tokens per request (compile-time constant)
     """
-    # Get the request index this program instance handles
+    # Get request index this program instance handles
     req_idx = tl.program_id(0)
 
     # Load token range [start_idx, end_idx) for this request
@@ -346,17 +356,14 @@ def tree_simple_validate_kernel(
     # Start backtracking from the end of the longest accepted path
     now_pos = max_end
 
-    # Load slot mappings
-    slots_mapping = tl.load(slots_mapping_ptr + offset)
-
     # Initialize output buffers with -1 (indicating unused positions)
-    final_slots_mapping = tl.full((num_tokens,), -1, dtype=tl.int32)
+    slots_mapping_map = tl.full((num_tokens,), -1, dtype=tl.int32)
     output_ids = tl.full((num_tokens,), -1, dtype=tl.int32)
 
     # Backtrack from end of longest path to root, filling output buffers
     # Path goes root-to-leaf, so output positions are 0 to max_len-1
     for i in range(max_len - 1, -1, -1):
-        final_slots_mapping[i] = slots_mapping[now_pos]
+        slots_mapping_map[i] = now_pos + start_idx
         output_ids[i] = sampled_tokens[now_pos]
         now_pos = parents[now_pos]  # Move to parent
 
@@ -364,4 +371,4 @@ def tree_simple_validate_kernel(
     tl.store(output_ids_ptr + req_idx * max_sampled_len + offset - start_idx, output_ids)
 
     # Write slot mappings to output buffer
-    tl.store(final_slots_mapping_ptr + offset, final_slots_mapping) 
+    tl.store(slots_mapping_map_ptr + offset, slots_mapping_map) 

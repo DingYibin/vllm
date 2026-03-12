@@ -835,6 +835,7 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> list[torch.Tensor]:
+        self.runner.reorder_kv_caches(slot_mappings)
         tree_attn_metadata_builder = self.runner.attn_groups[0][
             0
         ].get_metadata_builder()

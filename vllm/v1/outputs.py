@@ -118,7 +118,7 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
-    final_slots_mapping: torch.Tensor | None = None
+    slots_mapping_map: torch.Tensor | None = None
 
 
 @dataclass

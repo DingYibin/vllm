@@ -424,7 +424,7 @@ def reorder_kv_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    final_slot_mapping: torch.Tensor,
+    slot_mapping_map: torch.Tensor,
     tile_size: int = 64,
 ) -> None:
     """
@@ -478,6 +478,11 @@ def reorder_kv_cache(
         - Two-stage operation requires 2x memory reads/writes + temporary buffer
         - Temporary buffer size = num_tokens * num_kv_heads * head_size * sizeof(dtype)
     """
+    
+    final_slot_mapping = torch.where(
+        slot_mapping_map > 0,
+        slot_mapping[torch.clamp(slot_mapping_map, 0)],
+        -1)
 
     _reorder_cache(
         cache=key_cache,
