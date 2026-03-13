@@ -271,7 +271,7 @@ def tree_simple_validate(
         sampled_token_ids,
         num_tokens_range,
         tree_father,
-        max_sampled_len,
+        triton.next_power_of_2(max_sampled_len),
     )
 
     return output_ids, slot_mapping_map
