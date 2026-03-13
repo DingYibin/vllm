@@ -338,7 +338,7 @@ def tree_simple_validate_kernel(
         if pi < num_tokens:
             sampled_token = tl.load(sampled_token_ids_ptr + start_idx + pi)
             now_len = tl.sum(tl.where(offsets == pi, accepted_len, 0))
-            accepted = key_token_ids == sampled_token & parents == pi & now_len > 0
+            accepted = (key_token_ids == sampled_token & parents == pi) & now_len > 0
             new_len = now_len + 1
             accepted_len = tl.where(accepted, new_len, accepted)
 
