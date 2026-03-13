@@ -2839,6 +2839,7 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
+        print(f"{sampler_output=}")
         # else:
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
