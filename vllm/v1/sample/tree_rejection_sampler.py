@@ -158,7 +158,7 @@ def sample_all_tokens(
         if generator is not None:
             q[cu_num_tokens[i]:cu_num_tokens[i + 1]].exponential_(generator=generator)
 
-    return probs.div_(q).argmax(dim=-1).view(-1)
+    return probs.div_(q).argmax(dim=-1).view(-1).to(torch.int32)
 
 
 def apply_sampling_constraints(
@@ -350,8 +350,8 @@ def tree_simple_validate_kernel(
     max_end_idx = tl.argmax(accepted_len, axis=0)
     # Backtrack from the longest path end to collect accepted tokens
     # Initialize output buffers with -1 (placeholder for rejected/unused)
-    output_ids = tl.full([max_sampled_len], -1, dtype=tl.int32)
-    slot_mapping_map = tl.full([max_sampled_len], -1, dtype=tl.int32)
+    output_ids = tl.full([max_sampled_len], -1, dtype=output_ids_ptr.dtype.element_ty)
+    slot_mapping_map = tl.full([max_sampled_len], -1, dtype=slot_mapping_map_ptr.dtype.element_ty)
 
     # Fill output buffers by backtracking from max_end_idx to root
     curr_idx = max_end_idx
@@ -370,11 +370,11 @@ def tree_simple_validate_kernel(
     # Write results to global memory
     # Output IDs are written per-request row
     tl.store(output_ids_ptr + req_idx * max_sampled_len + offsets,
-             output_ids, mask=offsets < max_sampled_len)
+             output_ids.to(output_ids_ptr.dtype.element_ty), mask=offsets < max_sampled_len)
 
     # Slot mapping is written to the global token position
     tl.store(slot_mapping_map_ptr + start_idx + offsets,
-             slot_mapping_map, mask=valid_mask)
+             slot_mapping_map.to(slot_mapping_map_ptr.dtype.element_ty), mask=valid_mask)
 
 
 def test_tree_simple_validate():
