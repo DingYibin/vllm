@@ -44,7 +44,7 @@ class SpecDecodeMetadata:
     target_logits_indices: torch.Tensor
 
     # [batch_size] Indices into target logits for bonus tokens
-    bonus_logits_indices: torch.Tensor
+    bonus_logits_indices: torch.Tensor | None
 
     # [num_tokens + batch_size] Combined indices for all logits
     logits_indices: torch.Tensor

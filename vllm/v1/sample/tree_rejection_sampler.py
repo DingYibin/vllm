@@ -66,7 +66,7 @@ class TreeSimpleValidator(RejectionSampler):
         assert metadata.max_spec_len <= MAX_SPEC_LEN
         assert metadata.is_tree_mode, "TreeSimpleValidator requires tree mode metadata"
 
-        batch_size = metadata.bonus_logits_indices.shape[0]
+        batch_size = metadata.cu_num_draft_tokens.shape[0]
         device = logits.device
 
         # Compute cumulative indices for all tokens (draft + bonus)
