@@ -332,80 +332,146 @@ def tree_simple_validate_kernel(
     # Load input token IDs (original draft tokens that were expected)
     key_token_ids = tl.load(key_token_ids_ptr + start_idx + offsets,
                             mask=valid_mask, other=-1)
+    accepted_len = tl.zeros([max_sampled_len], dtype=tl.int32)
+    accepted_len = tl.where(offsets == 0, 1, accepted_len)
+    for pi in range(num_tokens):
+        sampled_token = tl.load(sampled_token_ids_ptr + start_idx + pi)
+        now_len = accepted_len[pi]
+        accepted = key_token_ids == sampled_token & parents == pi & now_len > 0
+        new_len = now_len + 1
+        accepted_len = torch.where(accepted, new_len, accepted)
 
-    # Load sampled token IDs from target model
-    parent_sampled_tokens = tl.load(sampled_token_ids_ptr + start_idx + parents,
-                             mask=valid_mask, other=-1)
 
-    # Build acceptance array using iterative DP
-    # accepted[i] = True if node i is on an accepted path
-    accepted = key_token_ids == parent_sampled_tokens
+    # Track the longest accepted path
+    max_len = tl.max(accepted_len)
+    max_end_idx = tl.argmax(accepted_len)
+    # Backtrack from the longest path end to collect accepted tokens
+    # Initialize output buffers with -1 (placeholder for rejected/unused)
+    output_ids = tl.full([max_sampled_len], -1, dtype=tl.int32)
+    slot_mapping_map = tl.full([max_sampled_len], -1, dtype=tl.int32)
 
-    # Root node (index 0) is always accepted
-    # It represents the prompt token that starts the speculation
-    accepted = tl.where(offsets == 0, True, accepted)
+    # Fill output buffers by backtracking from max_end_idx to root
+    curr_idx = max_end_idx
+    for i in range(max_len):  # Iterate from max depth down to 0
+        # Store the sampled token at this position
+        token = tl.load(sampled_token_ids_ptr + start_idx + curr_idx)
+        output_ids = tl.where(offsets == curr_idx, token, output_ids)
 
-    # accepted_len = tl.zeros([max_sampled_len], dtype=tl.int32)
-    # accepted_len = tl.where(offsets == 0, 1, accepted_len)
+        # Slot mapping: position i in output comes from slot start_idx + i
+        slot_mapping_map = tl.where(offsets == curr_idx, start_idx + max_len - 1 - i, slot_mapping_map)
 
-    # # Track the longest accepted path
-    # max_len = 1
-    # max_end_idx = 0
+        # Move to parent for next iteration
+        curr_idx = tl.load(tree_father_ptr + start_idx + curr_idx)
 
-    # # Iteratively compute path lengths and track maximum
-    # for i in tl.static_range(1, 16):  # Max tree depth = 16
-    #     # Only process if this is a valid position
-    #     if i < num_tokens:
-    #         # Get parent's path length
-    #         parent_idx = tl.load(tree_father_ptr + start_idx + i,
-    #                              mask=i < num_tokens, other=-1)
-    #         parent_len = 0
-    #         if parent_idx >= 0 and parent_idx < max_sampled_len:
-    #             parent_len = tl.load(accepted_len + parent_idx,
-    #                                  mask=parent_idx < num_tokens, other=0)
+    # Write results to global memory
+    # Output IDs are written per-request row
+    tl.store(output_ids_ptr + req_idx * max_sampled_len + offsets,
+             output_ids, mask=offsets < max_sampled_len)
 
-    #         # Check if this node is accepted
-    #         node_accepted = tl.load(accepted + i, mask=i < num_tokens, other=False)
-    #         key_id = tl.load(key_token_ids_ptr + start_idx + i,
-    #                          mask=i < num_tokens, other=-1)
-    #         parent_sampled = tl.load(sampled_token_ids_ptr + start_idx + parent_idx,
-    #                                   mask=(parent_idx >= 0) & (parent_idx < num_tokens),
-    #                                   other=-1)
+    # Slot mapping is written to the global token position
+    tl.store(slot_mapping_map_ptr + start_idx + offsets,
+             slot_mapping_map, mask=valid_mask)
 
-    #         if node_accepted and key_id == parent_sampled and parent_len > 0:
-    #             curr_len = parent_len + 1
-    #             accepted_len = tl.where(offsets == i, curr_len, accepted_len)
-    #             if curr_len > max_len:
-    #                 max_len = curr_len
-    #                 max_end_idx = i
 
-    # # Backtrack from the longest path end to collect accepted tokens
-    # # Initialize output buffers with -1 (placeholder for rejected/unused)
-    # output_ids = tl.full([max_sampled_len], -1, dtype=tl.int32)
-    # slot_mapping = tl.full([max_sampled_len], -1, dtype=tl.int32)
+def test_tree_simple_validate():
+    """Test the tree_simple_validate kernel.
 
-    # # Fill output buffers by backtracking from max_end_idx to root
-    # curr_idx = max_end_idx
-    # for i in tl.static_range(15, -1, -1):  # Iterate from max depth down to 0
-    #     if i < max_len and curr_idx >= 0:
-    #         # Store the sampled token at this position
-    #         token = tl.load(sampled_token_ids_ptr + start_idx + curr_idx,
-    #                        mask=curr_idx < num_tokens, other=-1)
-    #         output_ids = tl.where(offsets == i, token, output_ids)
+    This test verifies the correctness of tree-based rejection sampling.
 
-    #         # Slot mapping: position i in output comes from slot start_idx + i
-    #         slot_mapping = tl.where(offsets == i, start_idx + i, slot_mapping)
+    Test scenario:
+        We create a simple tree structure for 2 requests:
+        - Request 0: 4 tokens forming a tree with 2 branches
+            Tree structure:
+                0 (root)
+               / \\
+              1   2
+             /
+            3
+            tree_father: [0, 0, 0, 1] (relative indices within request)
 
-    #         # Move to parent for next iteration
-    #         curr_idx = tl.load(tree_father_ptr + start_idx + curr_idx,
-    #                           mask=curr_idx >= 0, other=-1)
+        - Request 1: 3 tokens forming a linear chain
+            Tree structure:
+                0 (root)
+               /
+              1
+             /
+            2
+            tree_father: [0, 0, 1]
 
-    # # Write results to global memory
-    # # Output IDs are written per-request row
-    # output_stride = max_sampled_len
-    # tl.store(output_ids_ptr + req_idx * output_stride + offsets,
-    #          output_ids, mask=offsets < max_sampled_len)
+    How to run:
+        python -m vllm.v1.sample.tree_rejection_sampler
 
-    # # Slot mapping is written to the global token position
-    # tl.store(slot_mapping_map_ptr + start_idx + offsets,
-    #          slot_mapping, mask=valid_mask)
+    Or in code:
+        from vllm.v1.sample.tree_rejection_sampler import test_tree_simple_validate
+        test_tree_simple_validate()
+    """
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cpu':
+        print("Warning: Running on CPU, Triton kernels may not work correctly")
+
+    # Test case 1: Simple tree with branching
+    # Request 0: 4 tokens
+    # Request 1: 3 tokens
+    batch_size = 2
+    max_sampled_len = 4
+
+    # Key token IDs: what the draft model predicted
+    # Request 0: [100, 101, 102, 103] (4 tokens)
+    # Request 1: [200, 201, 202] (3 tokens)
+    key_token_ids = torch.tensor([100, 101, 102, 103, 200, 201, 202],
+                                  dtype=torch.int32, device=device)
+
+    # Sampled token IDs: what the target model sampled
+    # For Request 0: match at position 0, 1, 3 -> accepted path is 0->1->3
+    # For Request 1: all match -> accepted path is 0->1->2
+    sampled_token_ids = torch.tensor([101, 103, 104, 105, 202, 203, 203],
+                                      dtype=torch.int32, device=device)
+
+    # Tree father: parent index for each token (relative to request start)
+    # Request 0: [0, 0, 0, 1] -> token 0 is root, token 1 & 2 are children of 0,
+    #                            token 3 is child of 1
+    # Request 1: [0, 0, 1] -> linear chain
+    # Note: tree_father values are global indices
+    tree_father = torch.tensor([-1, 0, 0, 1, -1, 0, 0],
+                               dtype=torch.int32, device=device)
+
+    # Cumulative token counts per request
+    # Request 0: tokens 0-3 (4 tokens)
+    # Request 1: tokens 4-6 (3 tokens)
+    cu_num_sampled_tokens = torch.tensor([4, 7], dtype=torch.int32, device=device)
+
+    # Build num_tokens_range (cumulative start indices)
+    num_tokens_range = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    num_tokens_range[1:] = cu_num_sampled_tokens
+
+
+    # Call the kernel
+    output_token_ids, result_slot_mapping = tree_simple_validate(
+        key_token_ids,
+        sampled_token_ids,
+        cu_num_sampled_tokens,
+        tree_father,
+        max_sampled_len,
+    )
+
+    print("Test Results:")
+    print(f"key_token_ids: {key_token_ids}")
+    print(f"sampled_token_ids: {sampled_token_ids}")
+    print(f"tree_father: {tree_father}")
+    print(f"output_token_ids: {output_token_ids}")
+    print(f"slot_mapping_map: {result_slot_mapping}")
+
+    # Expected results:
+    # Request 0: tokens 0, 1, 3 are accepted (path: 0->1->3, token 2 rejected)
+    #   output: [100, 101, 103, -1]
+    # Request 1: all tokens accepted
+    #   output: [200, 201, 202, -1]
+
+
+    return output_token_ids, result_slot_mapping
+
+
+if __name__ == "__main__":
+    test_tree_simple_validate()
