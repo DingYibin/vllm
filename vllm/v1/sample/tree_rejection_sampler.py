@@ -329,11 +329,12 @@ def tree_simple_validate_kernel(
     # Load parent's sampled token for validation
     # For root node (parent < 0), use key_token_ids[0] as placeholder (root always accepted)
     parent_forward_tokens = tl.load(sampled_token_ids_ptr + start_idx + parents,
-                                    mask=parents >= 0, other=key_token_ids[0])
+                                    mask=parents >= 0)
 
     # Check acceptance: input_id must match parent's sampled token
     # Root node (parents=0) automatically matches since parent_forward_tokens[0] = key_token_ids[0]
     accepted = key_token_ids == parent_forward_tokens
+    accepted[0] = True
 
     # accepted_len[i] stores the length of accepted path ending at node i
     accepted_len = tl.zeros((num_tokens,), dtype=tl.int32)
