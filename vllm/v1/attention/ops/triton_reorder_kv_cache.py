@@ -480,8 +480,10 @@ def reorder_kv_cache(
     """
     
     final_slot_mapping = torch.where(
-        slot_mapping_map > 0,
-        slot_mapping[torch.clamp(slot_mapping_map, 0)], -1)
+        slot_mapping_map >= 0,
+        slot_mapping[torch.clamp(slot_mapping_map, 0)],
+        -1,
+    )
 
     _reorder_cache(
         cache=key_cache,
@@ -504,18 +506,31 @@ def test_reorder_kv_cache():
     This test verifies whether the reordering operation correctly moves
     accepted token data to target positions while maintaining data integrity.
 
+    Interface change:
+        Old: reorder_kv_cache(key_cache, val_cache, slot_mapping, final_slot_mapping)
+        New: reorder_kv_cache(key_cache, val_cache, slot_mapping, slot_mapping_map)
+
+        slot_mapping_map[i] = position in the final sequence for token i
+        - slot_mapping_map[i] >= 0: accepted, moved to slot_mapping[slot_mapping_map[i]]
+        - slot_mapping_map[i] < 0: rejected
+
     Test scenario:
         - Create random Key/Value cache data
         - Set slot_mapping representing original positions of 15 tokens
-        - Set final_slot_mapping simulating acceptance/rejection results:
-            - tokens 0, 1, 3, 8 are accepted (final_slot >= 0)
-            - other tokens are rejected (final_slot == -1)
+        - Set slot_mapping_map simulating acceptance/rejection results:
+            - tokens 0, 1, 3, 8 are accepted (slot_mapping_map >= 0)
+            - other tokens are rejected (slot_mapping_map < 0)
+            - Accepted tokens move to consecutive positions:
+                - token 0 -> position 0 -> slot_mapping[0] = 116
+                - token 1 -> position 1 -> slot_mapping[1] = 117
+                - token 3 -> position 2 -> slot_mapping[2] = 118
+                - token 8 -> position 3 -> slot_mapping[3] = 119
         - Verify after reordering that accepted token data is correctly migrated
 
     Verification method:
-        Filter accepted tokens via mask, then compare:
-        - Data at slot_mapping positions in original cache
-        - Data at final_slot_mapping positions in reordered cache
+        For each accepted token, compare:
+        - Original data at slot_mapping[i]
+        - Final data at slot_mapping[slot_mapping_map[i]]
         These should be identical (allowing for floating point errors)
 
     How to run:
@@ -540,25 +555,49 @@ def test_reorder_kv_cache():
     )
     key_cache_ori = key_cache.clone()
     val_cache_ori = val_cache.clone()
+
+    # Original slot mapping: 15 tokens at slots 116-130
     slot_mapping = torch.arange(15, dtype=torch.int32, device='cuda') + 116
-    final_slot_mapping = torch.tensor(
-        [116, 117, -1, 118, -1, -1, -1, -1, 119, -1, -1, -1, -1, -1, -1],
-    dtype=torch.int32, device='cuda')
+
+    # slot_mapping_map: maps each token to its position in the final sequence
+    # - value >= 0: accepted, moved to slot_mapping[value]
+    # - value < 0: rejected
+    # Tokens 0, 1, 3, 8 are accepted at consecutive positions 0, 1, 2, 3
+    slot_mapping_map = torch.tensor(
+        [0, 1, -1, 2, -1, -1, -1, -1, 3, -1, -1, -1, -1, -1, -1],
+        dtype=torch.int32, device='cuda')
+
+    # Expected behavior:
+    # - Token 0 at slot 116 -> moves to slot_mapping[0] = 116
+    # - Token 1 at slot 117 -> moves to slot_mapping[1] = 117
+    # - Token 3 at slot 119 -> moves to slot_mapping[2] = 118
+    # - Token 8 at slot 124 -> moves to slot_mapping[3] = 119
+
     reorder_kv_cache(
-        key_cache, val_cache, slot_mapping, final_slot_mapping,
+        key_cache, val_cache, slot_mapping, slot_mapping_map,
     )
-    mask = (slot_mapping != -1) & (final_slot_mapping != -1)
-    masked_slot_mapping = slot_mapping[mask]
-    masked_final_slot_mapping = final_slot_mapping[mask]
 
-    final_key = key_cache.view(-1, num_kv_heads, key_head_size)[masked_final_slot_mapping]
-    ori_key = key_cache_ori.view(-1, num_kv_heads, key_head_size)[masked_slot_mapping]
+    # Accepted tokens and their expected destination slots
+    accepted_tokens = [0, 1, 3, 8]
+    expected_dest_slots = [116, 117, 118, 119]  # slot_mapping[slot_mapping_map[i]]
+    source_slots = [116, 117, 119, 124]  # original slots slot_mapping[i]
 
-    final_val = val_cache.view(-1, num_kv_heads, val_head_size)[masked_final_slot_mapping]
-    ori_val = val_cache_ori.view(-1, num_kv_heads, val_head_size)[masked_slot_mapping]
+    for token_idx, src_slot, dst_slot in zip(accepted_tokens, source_slots,
+                                              expected_dest_slots):
+        final_key = key_cache.view(-1, num_kv_heads, key_head_size)[dst_slot]
+        ori_key = key_cache_ori.view(-1, num_kv_heads, key_head_size)[src_slot]
 
-    print(f"{(final_key - ori_key).abs().max()=}")
-    print(f"{(final_val - ori_val).abs().max()=}")
+        final_val = val_cache.view(-1, num_kv_heads, val_head_size)[dst_slot]
+        ori_val = val_cache_ori.view(-1, num_kv_heads, val_head_size)[src_slot]
+
+        key_diff = (final_key - ori_key).abs().max().item()
+        val_diff = (final_val - ori_val).abs().max().item()
+        print(f"Token {token_idx}: key_diff={key_diff:.6f}, val_diff={val_diff:.6f}")
+
+        assert key_diff < 1e-2, f"Token {token_idx} key mismatch: {key_diff}"
+        assert val_diff < 1e-2, f"Token {token_idx} val mismatch: {val_diff}"
+
+    print("All tests passed!")
 
 
 if __name__ == "__main__":

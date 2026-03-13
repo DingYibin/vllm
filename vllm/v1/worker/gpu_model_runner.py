@@ -1598,10 +1598,10 @@ class GPUModelRunner(
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
         attn_metadata: PerLayerAttnMetadata = {}
-        self.slot_mapping = {}
+        self.slot_mappings = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
-            self.slot_mapping = [dict() for _ in range(len(ubatch_slices))]
+            self.slot_mappings = [dict() for _ in range(len(ubatch_slices))]
 
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
@@ -1750,11 +1750,11 @@ class GPUModelRunner(
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
-                slots_mapping_dict = self.slot_mapping
+                slots_mapping_dict = self.slot_mappings
             else:
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
-                slots_mapping_dict = self.slot_mapping[ubid]
+                slots_mapping_dict = self.slot_mappings[ubid]
 
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
@@ -2772,6 +2772,7 @@ class GPUModelRunner(
                 logits,
                 sampling_metadata,
             )
+        self.slot_mapping_map = sampler_output.slot_mapping_map
         return sampler_output
 
     def _bookkeeping_sync(
@@ -5786,5 +5787,5 @@ class GPUModelRunner(
             return
         for layer_name in self.slot_mappings:
             kv_cache = self.kv_caches[layer_name]
-            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slot_mapping_map)
+            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], self.slot_mapping_map)
         self.slot_mapping_map = None
