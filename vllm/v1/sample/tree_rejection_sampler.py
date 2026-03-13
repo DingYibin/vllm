@@ -334,12 +334,13 @@ def tree_simple_validate_kernel(
                             mask=valid_mask, other=-1)
     accepted_len = tl.zeros([max_sampled_len], dtype=tl.int32)
     accepted_len = tl.where(offsets == 0, 1, accepted_len)
-    for pi in range(num_tokens):
-        sampled_token = tl.load(sampled_token_ids_ptr + start_idx + pi)
-        now_len = accepted_len[pi]
-        accepted = key_token_ids == sampled_token & parents == pi & now_len > 0
-        new_len = now_len + 1
-        accepted_len = tl.where(accepted, new_len, accepted)
+    for pi in range(max_sampled_len):
+        if pi < num_tokens:
+            sampled_token = tl.load(sampled_token_ids_ptr + start_idx + pi)
+            now_len = accepted_len[pi]
+            accepted = key_token_ids == sampled_token & parents == pi & now_len > 0
+            new_len = now_len + 1
+            accepted_len = tl.where(accepted, new_len, accepted)
 
 
     # Track the longest accepted path
@@ -352,16 +353,17 @@ def tree_simple_validate_kernel(
 
     # Fill output buffers by backtracking from max_end_idx to root
     curr_idx = max_end_idx
-    for i in range(max_len):  # Iterate from max depth down to 0
-        # Store the sampled token at this position
-        token = tl.load(sampled_token_ids_ptr + start_idx + curr_idx)
-        output_ids = tl.where(offsets == curr_idx, token, output_ids)
+    for i in range(max_sampled_len):  # Iterate from max depth down to 0
+        if curr_idx != -1:
+            # Store the sampled token at this position
+            token = tl.load(sampled_token_ids_ptr + start_idx + curr_idx)
+            output_ids = tl.where(offsets == curr_idx, token, output_ids)
 
-        # Slot mapping: position i in output comes from slot start_idx + i
-        slot_mapping_map = tl.where(offsets == curr_idx, start_idx + max_len - 1 - i, slot_mapping_map)
+            # Slot mapping: position i in output comes from slot start_idx + i
+            slot_mapping_map = tl.where(offsets == curr_idx, start_idx + max_len - 1 - i, slot_mapping_map)
 
-        # Move to parent for next iteration
-        curr_idx = tl.load(tree_father_ptr + start_idx + curr_idx)
+            # Move to parent for next iteration
+            curr_idx = tl.load(tree_father_ptr + start_idx + curr_idx)
 
     # Write results to global memory
     # Output IDs are written per-request row
