@@ -279,7 +279,7 @@ def tree_simple_validate(
 @triton.jit(do_not_specialize=["max_sampled_len"])
 def tree_simple_validate_kernel(
     output_ids_ptr,  # [batch_size, max_sampled_len] Output buffer for accepted token IDs
-    slot_mapping_map_ptr,
+    slot_mapping_map_ptr,  # [num_tokens] Slot mapping for KV cache reordering
     key_token_ids_ptr,  # [num_tokens] Input token IDs (original draft tokens to validate)
     sampled_token_ids_ptr,  # [num_tokens] Sampled token IDs from target model
     num_tokens_range_ptr,  # [batch_size + 1] Cumulative token counts, start index per request
@@ -290,15 +290,16 @@ def tree_simple_validate_kernel(
 
     This kernel validates draft tokens following a tree structure:
     - Each node represents a draft token with a parent-child relationship
-    - A token is accepted only if its parent is accepted AND input_id matches
+    - A token is accepted only if its parent is accepted AND key_token_id matches
       the parent's sampled token
     - The kernel finds the longest accepted path and outputs those tokens
 
     Each program instance processes one request independently.
 
     Args:
-        output_ids_ptr: Output [batch_size, max_sampled_len] for accepted token IDs
-        input_ids_ptr: Input token IDs that were supposed to be sampled
+        output_ids_ptr: Output buffer [batch_size, max_sampled_len] for accepted token IDs
+        slot_mapping_map_ptr: Output buffer [num_tokens] for slot mapping
+        key_token_ids_ptr: Input token IDs that were supposed to be sampled
         sampled_token_ids_ptr: Actually sampled token IDs from target model
         num_tokens_range_ptr: Cumulative token counts, num_tokens_range_ptr[i] = start index
         tree_father_ptr: Parent index for each token defining tree structure
@@ -310,67 +311,101 @@ def tree_simple_validate_kernel(
     # Load token range [start_idx, end_idx) for this request
     start_idx = tl.load(num_tokens_range_ptr + req_idx)
     end_idx = tl.load(num_tokens_range_ptr + req_idx + 1)
-
-    offset = tl.arange(0, max_sampled_len)
     num_tokens = end_idx - start_idx
+
+    # Early exit for empty requests
     if num_tokens == 0:
         return
-    mask = offset < num_tokens
+
+    # Create offset range for vectorized loads
+    # Use max_sampled_len as the vectorization width (compile-time constant)
+    offsets = tl.arange(0, max_sampled_len)
+
+    # Mask for valid token positions within this request
+    valid_mask = offsets < num_tokens
 
     # Load tree structure: parent index for each token
-    parents = tl.load(tree_father_ptr + offset + start_idx, mask=mask, other=-1)
+    # parent[i] = index of parent node relative to start_idx, -1 for root
+    parents = tl.load(tree_father_ptr + start_idx + offsets,
+                      mask=valid_mask, other=0)
 
-    # Load input token IDs (original draft tokens)
-    key_token_ids = tl.load(key_token_ids_ptr + offset + start_idx, mask=mask, other=-1)
+    # Load input token IDs (original draft tokens that were expected)
+    key_token_ids = tl.load(key_token_ids_ptr + start_idx + offsets,
+                            mask=valid_mask, other=-1)
 
     # Load sampled token IDs from target model
-    sampled_tokens = tl.load(sampled_token_ids_ptr + offset + start_idx, mask=mask, other=-1)
+    parent_sampled_tokens = tl.load(sampled_token_ids_ptr + start_idx + parents,
+                             mask=valid_mask, other=-1)
 
-    # Load parent's sampled token for validation
-    # For root node (parent < 0), use key_token_ids[0] as placeholder (root always accepted)
-    parent_forward_tokens = tl.load(sampled_token_ids_ptr + start_idx + parents,
-                                    mask=parents >= 0)
+    # Build acceptance array using iterative DP
+    # accepted[i] = True if node i is on an accepted path
+    accepted = key_token_ids == parent_sampled_tokens
 
-    # Check acceptance: input_id must match parent's sampled token
-    # Root node (parents=0) automatically matches since parent_forward_tokens[0] = key_token_ids[0]
-    accepted = key_token_ids == parent_forward_tokens
-    accepted[0] = True
+    # Root node (index 0) is always accepted
+    # It represents the prompt token that starts the speculation
+    accepted = tl.where(offsets == 0, True, accepted)
 
-    # accepted_len[i] stores the length of accepted path ending at node i
-    accepted_len = tl.zeros((num_tokens,), dtype=tl.int32)
-    accepted_len[0] = 1  # Root is always accepted with path length 1
+    # accepted_len = tl.zeros([max_sampled_len], dtype=tl.int32)
+    # accepted_len = tl.where(offsets == 0, 1, accepted_len)
 
-    # Track the longest accepted path length and its ending position
-    max_len = 1
-    max_end = 0
+    # # Track the longest accepted path
+    # max_len = 1
+    # max_end_idx = 0
 
-    # Iterate through all non-root tokens to compute accepted path lengths
-    for i in range(1, num_tokens):
-        p = parents[i]  # Get parent index of node i
-        if accepted_len[p] > 0 and accepted[i]:
-            # Parent accepted and current node matches: extend path by 1
-            accepted_len[i] = accepted_len[p] + 1
-            # Update longest path if this one is longer
-            if accepted_len[i] > max_len:
-                max_end = i
-                max_len = accepted_len[i]
-        else:
-            # Parent rejected or current node mismatch: path length is 0
-            accepted_len[i] = 0
+    # # Iteratively compute path lengths and track maximum
+    # for i in tl.static_range(1, 16):  # Max tree depth = 16
+    #     # Only process if this is a valid position
+    #     if i < num_tokens:
+    #         # Get parent's path length
+    #         parent_idx = tl.load(tree_father_ptr + start_idx + i,
+    #                              mask=i < num_tokens, other=-1)
+    #         parent_len = 0
+    #         if parent_idx >= 0 and parent_idx < max_sampled_len:
+    #             parent_len = tl.load(accepted_len + parent_idx,
+    #                                  mask=parent_idx < num_tokens, other=0)
 
-    # Start backtracking from the end of the longest accepted path
-    now_pos = max_end
+    #         # Check if this node is accepted
+    #         node_accepted = tl.load(accepted + i, mask=i < num_tokens, other=False)
+    #         key_id = tl.load(key_token_ids_ptr + start_idx + i,
+    #                          mask=i < num_tokens, other=-1)
+    #         parent_sampled = tl.load(sampled_token_ids_ptr + start_idx + parent_idx,
+    #                                   mask=(parent_idx >= 0) & (parent_idx < num_tokens),
+    #                                   other=-1)
 
-    output_ids = tl.full((num_tokens,), -1, dtype=tl.int32)
-    slot_mapping_map = tl.full((num_tokens,), -1, dtype=tl.int32)
+    #         if node_accepted and key_id == parent_sampled and parent_len > 0:
+    #             curr_len = parent_len + 1
+    #             accepted_len = tl.where(offsets == i, curr_len, accepted_len)
+    #             if curr_len > max_len:
+    #                 max_len = curr_len
+    #                 max_end_idx = i
 
-    # Backtrack from end of longest path to root, filling output buffers
-    # Path goes root-to-leaf, so output positions are 0 to max_len-1
-    for i in range(max_len - 1, -1, -1):
-        output_ids[now_pos] = sampled_tokens[now_pos]
-        slot_mapping_map[now_pos] = start_idx + i
-        now_pos = parents[now_pos]  # Move to parent
+    # # Backtrack from the longest path end to collect accepted tokens
+    # # Initialize output buffers with -1 (placeholder for rejected/unused)
+    # output_ids = tl.full([max_sampled_len], -1, dtype=tl.int32)
+    # slot_mapping = tl.full([max_sampled_len], -1, dtype=tl.int32)
 
-    # Write output token IDs to the corresponding request row
-    tl.store(output_ids_ptr + req_idx * max_sampled_len + offset - start_idx, output_ids)
-    tl.store(slot_mapping_map_ptr + offset, slot_mapping_map)
+    # # Fill output buffers by backtracking from max_end_idx to root
+    # curr_idx = max_end_idx
+    # for i in tl.static_range(15, -1, -1):  # Iterate from max depth down to 0
+    #     if i < max_len and curr_idx >= 0:
+    #         # Store the sampled token at this position
+    #         token = tl.load(sampled_token_ids_ptr + start_idx + curr_idx,
+    #                        mask=curr_idx < num_tokens, other=-1)
+    #         output_ids = tl.where(offsets == i, token, output_ids)
+
+    #         # Slot mapping: position i in output comes from slot start_idx + i
+    #         slot_mapping = tl.where(offsets == i, start_idx + i, slot_mapping)
+
+    #         # Move to parent for next iteration
+    #         curr_idx = tl.load(tree_father_ptr + start_idx + curr_idx,
+    #                           mask=curr_idx >= 0, other=-1)
+
+    # # Write results to global memory
+    # # Output IDs are written per-request row
+    # output_stride = max_sampled_len
+    # tl.store(output_ids_ptr + req_idx * output_stride + offsets,
+    #          output_ids, mask=offsets < max_sampled_len)
+
+    # # Slot mapping is written to the global token position
+    # tl.store(slot_mapping_map_ptr + start_idx + offsets,
+    #          slot_mapping, mask=valid_mask)
