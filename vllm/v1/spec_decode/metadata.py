@@ -51,50 +51,20 @@ class SpecDecodeMetadata:
 
     # === Tree-mode specific fields ===
 
-    input_ids: torch.Tensor | None = None
-    # Tree structure definition: list of paths from root to each node.
-    # Example: [(0,), (1,), (0, 0), (0, 1), (1, 0), (1, 1)]
-    # represents a 2-branch, 2-level tree:
-    #         root
-    #        /    \
-    #      (0)    (1)
-    #     /  \    /  \
-    #   (0,0)(0,1)(1,0)(1,1)
-    tree_choices: list[tuple[int, ...]] | None = None
+    key_token_ids: torch.Tensor | None = None
 
     # [num_tree_nodes] Parent index for each tree node.
     # -1 indicates the root node (no parent).
     # Used to propagate rejection from parent to children.
     tree_father: torch.Tensor | None = None
 
-    # Cumulative number of draft tokens at each tree level.
-    # Used to index into draft_token_ids by level.
-    # Example: for a 2-level tree with 2 branches each:
-    #   cu_drafts_per_level = [2, 6] (level 0: 2 nodes, total 2; level 1: 4 nodes, total 6)
-    cu_drafts_per_level: list[int] | None = None
-
-    # Number of child nodes per parent at each level.
-    # Example: [2, 2] means each node at level 0 and 1 has 2 children.
-    child_drafts_per_level: list[int] | None = None
-
-    # Number of tree nodes per request (for batched tree decoding).
-    # In tree mode, this is len(tree_choices).
-    # None for linear mode or when batch_size > 1 with different trees.
-    num_tree_nodes: int | None = None
-
-    # Maximum tree depth (number of levels).
-    tree_depth: int | None = None
-
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
-
-        self.num_tree_nodes = len(self.tree_choices) if self.tree_choices is not None else 0
-        self.tree_depth = len(self.tree_choices[-1]) if self.tree_choices is not None else 0
 
     @property
     def is_tree_mode(self) -> bool:
         """Check if this metadata represents tree-based speculative decoding."""
-        return self.tree_choices is not None
+        return self.tree_father is not None
 
     @classmethod
     def make_dummy(

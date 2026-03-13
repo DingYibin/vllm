@@ -99,7 +99,7 @@ class TreeSimpleValidator(RejectionSampler):
         #   - slot_mapping_map: mapping from output positions to original slot indices
         #     (used for KV cache reordering when speculation tree doesn't match final sequence)
         output_token_ids, slot_mapping_map = tree_simple_validate(
-            metadata.input_ids,
+            metadata.key_token_ids,
             sampled_token_ids,
             cu_num_sampled_tokens,
             metadata.tree_father,
@@ -219,7 +219,7 @@ def apply_sampling_constraints(
     return apply_top_k_top_p(logits, top_k, top_p)
 
 def tree_simple_validate(
-    input_ids,
+    key_token_ids,
     sampled_token_ids,
     cu_num_sampled_tokens,
     tree_father,
@@ -242,7 +242,7 @@ def tree_simple_validate(
         - output_ids: [batch_size, max_sampled_len] Accepted token IDs
         - slot_mapping_map: [num_tokens] Slot mapping for accepted tokens
     """
-    device = input_ids.device
+    device = key_token_ids.device
     batch_size = cu_num_sampled_tokens.shape[0]
 
     # Build token range array: [start_idx for each request]
@@ -258,16 +258,16 @@ def tree_simple_validate(
     # Allocate output buffer for accepted token IDs
     output_ids = torch.full(
         (batch_size, max_sampled_len), -1,
-        dtype=input_ids.dtype, device=device,
+        dtype=key_token_ids.dtype, device=device,
     )
 
-    slot_mapping_map = torch.full_like(input_ids, -1)
+    slot_mapping_map = torch.full_like(key_token_ids, -1)
 
     # Launch kernel
     tree_simple_validate_kernel[grid](
         output_ids,
         slot_mapping_map,
-        input_ids,
+        key_token_ids,
         sampled_token_ids,
         num_tokens_range,
         tree_father,
@@ -280,7 +280,7 @@ def tree_simple_validate(
 def tree_simple_validate_kernel(
     output_ids_ptr,  # [batch_size, max_sampled_len] Output buffer for accepted token IDs
     slot_mapping_map_ptr,
-    input_ids_ptr,  # [num_tokens] Input token IDs (original draft tokens to validate)
+    key_token_ids_ptr,  # [num_tokens] Input token IDs (original draft tokens to validate)
     sampled_token_ids_ptr,  # [num_tokens] Sampled token IDs from target model
     num_tokens_range_ptr,  # [batch_size + 1] Cumulative token counts, start index per request
     tree_father_ptr,  # [num_tokens] Parent index for each token (-1 for root)
@@ -319,19 +319,19 @@ def tree_simple_validate_kernel(
     parents = tl.load(tree_father_ptr + offset)
 
     # Load input token IDs (original draft tokens)
-    input_ids = tl.load(input_ids_ptr + offset)
+    key_token_ids = tl.load(key_token_ids_ptr + offset)
 
     # Load sampled token IDs from target model
     sampled_tokens = tl.load(sampled_token_ids_ptr + offset)
 
     # Load parent's sampled token for validation
-    # For root node (parent < 0), use input_ids[0] as placeholder (root always accepted)
+    # For root node (parent < 0), use key_token_ids[0] as placeholder (root always accepted)
     parent_forward_tokens = tl.load(sampled_token_ids_ptr + start_idx + parents,
-                                    mask=parents >= 0, other=input_ids[0])
+                                    mask=parents >= 0, other=key_token_ids[0])
 
     # Check acceptance: input_id must match parent's sampled token
-    # Root node (parents=0) automatically matches since parent_forward_tokens[0] = input_ids[0]
-    accepted = input_ids == parent_forward_tokens
+    # Root node (parents=0) automatically matches since parent_forward_tokens[0] = key_token_ids[0]
+    accepted = key_token_ids == parent_forward_tokens
 
     # accepted_len[i] stores the length of accepted path ending at node i
     accepted_len = tl.zeros((num_tokens,), dtype=tl.int32)

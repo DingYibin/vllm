@@ -1553,9 +1553,10 @@ class GPUModelRunner(
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens
             )
-            print(f"{self._calc_tree_spec_decode_metadata(
+            self.tree_spec_decode_metadata = self._calc_tree_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens
-            )=}")
+            )
+            print(f"{self.tree_spec_decode_metadata=}")
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -2192,7 +2193,7 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
 
-        
+        key_token_ids = self.input_ids.gpu[logits_indices]
 
         return SpecDecodeMetadata(
             draft_token_ids=None,
@@ -2202,6 +2203,7 @@ class GPUModelRunner(
             target_logits_indices=None,
             bonus_logits_indices=None,
             logits_indices=logits_indices,
+            key_token_ids=key_token_ids,
             tree_father=tree_father,
         )
 
@@ -2830,20 +2832,20 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        if spec_decode_metadata.is_tree_mode:
-            sampler_output = self.tree_validator(
-                spec_decode_metadata,
-                None,  # draft_probs
-                logits,
-                sampling_metadata,
-            )
-        else:
-            sampler_output = self.rejection_sampler(
-                spec_decode_metadata,
-                None,  # draft_probs
-                logits,
-                sampling_metadata,
-            )
+        # if spec_decode_metadata.is_tree_mode:
+        sampler_output = self.tree_validator(
+            self.tree_spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
+        # else:
+        sampler_output = self.rejection_sampler(
+            spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
         self.slot_mapping_map = sampler_output.slot_mapping_map
         return sampler_output
 
