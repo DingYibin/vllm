@@ -310,19 +310,21 @@ def tree_simple_validate_kernel(
     # Load token range [start_idx, end_idx) for this request
     start_idx = tl.load(num_tokens_range_ptr + req_idx)
     end_idx = tl.load(num_tokens_range_ptr + req_idx + 1)
-    num_tokens = end_idx - start_idx
 
-    # Create index range for batch loading all tokens of this request
-    offset = tl.arange(start_idx, end_idx)
+    offset = tl.arange(0, max_sampled_len)
+    num_tokens = end_idx - start_idx
+    if num_tokens == 0:
+        return
+    mask = offset < num_tokens
 
     # Load tree structure: parent index for each token
-    parents = tl.load(tree_father_ptr + offset)
+    parents = tl.load(tree_father_ptr + offset + start_idx, mask=mask, other=-1)
 
     # Load input token IDs (original draft tokens)
-    key_token_ids = tl.load(key_token_ids_ptr + offset)
+    key_token_ids = tl.load(key_token_ids_ptr + offset + start_idx, mask=mask, other=-1)
 
     # Load sampled token IDs from target model
-    sampled_tokens = tl.load(sampled_token_ids_ptr + offset)
+    sampled_tokens = tl.load(sampled_token_ids_ptr + offset + start_idx, mask=mask, other=-1)
 
     # Load parent's sampled token for validation
     # For root node (parent < 0), use key_token_ids[0] as placeholder (root always accepted)
