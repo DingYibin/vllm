@@ -481,8 +481,7 @@ def reorder_kv_cache(
     
     final_slot_mapping = torch.where(
         slot_mapping_map > 0,
-        slot_mapping[torch.clamp(slot_mapping_map, 0)],
-        -1)
+        slot_mapping[torch.clamp(slot_mapping_map, 0)], -1)
 
     _reorder_cache(
         cache=key_cache,

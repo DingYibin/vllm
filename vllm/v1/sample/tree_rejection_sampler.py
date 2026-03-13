@@ -94,12 +94,15 @@ class TreeSimpleValidator(RejectionSampler):
         )
 
         # Perform tree-based rejection sampling
-        output_token_ids = tree_simple_validate(
+        # Returns:
+        #   - output_token_ids: accepted token IDs from the longest accepted path
+        #   - slot_mapping_map: mapping from output positions to original slot indices
+        #     (used for KV cache reordering when speculation tree doesn't match final sequence)
+        output_token_ids, slot_mapping_map = tree_simple_validate(
             metadata.input_ids,
             sampled_token_ids,
             cu_num_sampled_tokens,
             metadata.tree_father,
-            sampling_metadata.slot_mapping,
             metadata.max_spec_len + 1,
         )
 
@@ -127,6 +130,7 @@ class TreeSimpleValidator(RejectionSampler):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+            slot_mapping_map=slot_mapping_map,
         )
 
 def sample_all_tokens(
@@ -234,9 +238,9 @@ def tree_simple_validate(
         max_sampled_len: Maximum number of tokens per request
 
     Returns:
-        Tuple of (output_ids, slots_mapping_map):
+        Tuple of (output_ids, slot_mapping_map):
         - output_ids: [batch_size, max_sampled_len] Accepted token IDs
-        - slots_mapping_map: [num_tokens] Slot mapping for accepted tokens
+        - slot_mapping_map: [num_tokens] Slot mapping for accepted tokens
     """
     device = input_ids.device
     batch_size = cu_num_sampled_tokens.shape[0]
@@ -257,9 +261,12 @@ def tree_simple_validate(
         dtype=input_ids.dtype, device=device,
     )
 
+    slot_mapping_map = torch.full_like(input_ids, -1)
+
     # Launch kernel
     tree_simple_validate_kernel[grid](
         output_ids,
+        slot_mapping_map,
         input_ids,
         sampled_token_ids,
         num_tokens_range,
@@ -267,11 +274,12 @@ def tree_simple_validate(
         max_sampled_len,
     )
 
-    return output_ids
+    return output_ids, slot_mapping_map
 
 @triton.jit(do_not_specialize=["max_sampled_len"])
 def tree_simple_validate_kernel(
     output_ids_ptr,  # [batch_size, max_sampled_len] Output buffer for accepted token IDs
+    slot_mapping_map_ptr,
     input_ids_ptr,  # [num_tokens] Input token IDs (original draft tokens to validate)
     sampled_token_ids_ptr,  # [num_tokens] Sampled token IDs from target model
     num_tokens_range_ptr,  # [batch_size + 1] Cumulative token counts, start index per request
@@ -351,13 +359,15 @@ def tree_simple_validate_kernel(
     now_pos = max_end
 
     output_ids = tl.full((num_tokens,), -1, dtype=tl.int32)
+    slot_mapping_map = tl.full((num_tokens,), -1, dtype=tl.int32)
 
     # Backtrack from end of longest path to root, filling output buffers
     # Path goes root-to-leaf, so output positions are 0 to max_len-1
     for i in range(max_len - 1, -1, -1):
         output_ids[now_pos] = sampled_tokens[now_pos]
+        slot_mapping_map[now_pos] = start_idx + i
         now_pos = parents[now_pos]  # Move to parent
 
     # Write output token IDs to the corresponding request row
     tl.store(output_ids_ptr + req_idx * max_sampled_len + offset - start_idx, output_ids)
-
+    tl.store(slot_mapping_map_ptr + offset, slot_mapping_map)

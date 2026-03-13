@@ -689,7 +689,9 @@ class GPUModelRunner(
         self.layerwise_nvtx_hooks_registered = False
 
         self.printed = False
-        self.slots_mapping_map = None
+        # Slot mapping for KV cache reordering after tree speculation acceptance.
+        # Set by the sampler when tree speculation is used, consumed by reorder_kv_caches().
+        self.slot_mapping_map = None
         self.slot_mapping = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -5780,9 +5782,9 @@ class GPUModelRunner(
         return pinned.tolist()
 
     def reorder_kv_caches(self, keep_flag, ) -> None:
-        if self.slots_mapping_map is None:
+        if self.slot_mapping_map is None:
             return
         for layer_name in self.slot_mappings:
             kv_cache = self.kv_caches[layer_name]
-            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slots_mapping_map)
-        self.slots_mapping_map = None
+            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slot_mapping_map)
+        self.slot_mapping_map = None

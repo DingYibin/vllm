@@ -110,6 +110,12 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # Slot mapping for KV cache reordering after tree speculation acceptance.
+    # Maps each accepted token's position in the output to its original slot index.
+    # Used to reorder KV cache entries when the accepted path differs from the
+    # original speculation tree structure.
+    # Shape: [num_tokens], value is -1 for rejected tokens.
+    slot_mapping_map: torch.Tensor | None = None
 
 
 @dataclass
