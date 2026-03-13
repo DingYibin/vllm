@@ -339,7 +339,7 @@ def tree_simple_validate_kernel(
         now_len = accepted_len[pi]
         accepted = key_token_ids == sampled_token & parents == pi & now_len > 0
         new_len = now_len + 1
-        accepted_len = torch.where(accepted, new_len, accepted)
+        accepted_len = tl.where(accepted, new_len, accepted)
 
 
     # Track the longest accepted path
