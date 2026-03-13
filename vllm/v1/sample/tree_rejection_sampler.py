@@ -346,8 +346,7 @@ def tree_simple_validate_kernel(
 
 
     # Track the longest accepted path
-    max_len = tl.max(accepted_len)
-    max_end_idx = tl.argmax(accepted_len)
+    max_len, max_end_idx = tl.max(accepted_len, return_indices=True)
     # Backtrack from the longest path end to collect accepted tokens
     # Initialize output buffers with -1 (placeholder for rejected/unused)
     output_ids = tl.full([max_sampled_len], -1, dtype=tl.int32)
