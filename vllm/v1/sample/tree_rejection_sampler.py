@@ -342,7 +342,7 @@ def tree_simple_validate_kernel(
                         & (now_len > 0)
                         & (parents == pi))
             new_len = now_len + 1
-            accepted_len = tl.where(accepted, new_len, accepted)
+            accepted_len = tl.where(accepted, new_len, accepted_len)
 
 
     # Track the longest accepted path
