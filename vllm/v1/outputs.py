@@ -116,6 +116,8 @@ class SamplerOutput:
     # original speculation tree structure.
     # Shape: [num_tokens], value is -1 for rejected tokens.
     slot_mapping_map: torch.Tensor | None = None
+    tree_next_token_indices: torch.Tensor | None = None
+    tree_last_token_indices: torch.Tensor | None = None
 
 
 @dataclass

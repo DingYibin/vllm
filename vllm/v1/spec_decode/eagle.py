@@ -262,6 +262,10 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mapping_map: torch.Tensor | None = None,
+        tree_next_token_indices: torch.Tensor | None = None,
+        tree_last_token_indices: torch.Tensor | None = None,
+        logits_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
@@ -278,6 +282,9 @@ class EagleProposer:
         # Shift the input ids by one token.
         # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
         self.input_ids[: num_tokens - 1] = target_token_ids[1:]
+        if tree_next_token_indices is not None and logits_indices is not None:
+            self.input_ids[logits_indices] = target_token_ids[tree_next_token_indices]
+            last_token_indices = tree_last_token_indices
         # Replace the last token with the next token.
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
         self.input_ids[last_token_indices] = next_token_ids
@@ -389,6 +396,8 @@ class EagleProposer:
             hidden_states = hidden_states[last_token_indices]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
+            if self.runner is not None:
+                self.runner.reorder_kv_caches(slot_mapping_map)
             # Draft using tree attention.
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,

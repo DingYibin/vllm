@@ -1550,13 +1550,15 @@ class GPUModelRunner(
                     >= self.input_batch.num_prompt_tokens[req_idx]
                 ):
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
-            )
-            self.tree_spec_decode_metadata = self._calc_tree_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
-            )
-            print(f"{self.tree_spec_decode_metadata=}")
+            
+            if self.tree_father is None:
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_tokens, cu_num_tokens
+                )
+            else:
+                spec_decode_metadata = self._calc_tree_spec_decode_metadata(
+                    num_draft_tokens, cu_num_tokens
+                )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -2832,21 +2834,20 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        # if spec_decode_metadata.is_tree_mode:
-        sampler_output = self.tree_validator(
-            self.tree_spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
-        print(f"{sampler_output=}")
-        # else:
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        if spec_decode_metadata.is_tree_mode:
+            sampler_output = self.tree_validator(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
+        else:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         self.slot_mapping_map = sampler_output.slot_mapping_map
         return sampler_output
 
@@ -3527,6 +3528,7 @@ class GPUModelRunner(
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    sampler_output,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -3732,6 +3734,7 @@ class GPUModelRunner(
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
+        sampler_output: SamplerOutput,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -3882,6 +3885,9 @@ class GPUModelRunner(
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                tree_next_token_index=sampler_output.tree_next_token_indices,
+                tree_last_token_indices=sampler_output.tree_last_token_indices,
+                logits_indices=spec_decode_metadata.logits_indices,
             )
 
         return draft_token_ids
@@ -5857,10 +5863,7 @@ class GPUModelRunner(
         self.transfer_event.synchronize()
         return pinned.tolist()
 
-    def reorder_kv_caches(self, keep_flag, ) -> None:
-        if self.slot_mapping_map is None:
-            return
+    def reorder_kv_caches(self, slot_mapping_map: torch.Tensor) -> None:
         for layer_name in self.slot_mappings:
             kv_cache = self.kv_caches[layer_name]
-            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], self.slot_mapping_map)
-        self.slot_mapping_map = None
+            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slot_mapping_map)
