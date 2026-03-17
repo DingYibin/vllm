@@ -267,10 +267,10 @@ def tree_simple_validate(
                                    dtype=cu_num_sampled_tokens.dtype,
                                    device=device)
     num_tokens_range[1:] = cu_num_sampled_tokens
-
+    num_sampled_tokens = num_tokens_range[1:] - num_tokens_range[:-1]
     parent_idx = torch.repeat_interleave(
         input=num_tokens_range[:batch_size],
-        repeats=cu_num_sampled_tokens,
+        repeats=num_sampled_tokens,
         output_size=num_tokens,
     )
     parent_idx = torch.where(tree_father == -1,
