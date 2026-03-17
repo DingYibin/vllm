@@ -5875,7 +5875,9 @@ class GPUModelRunner(
         self.transfer_event.synchronize()
         return pinned.tolist()
 
-    def reorder_kv_caches(self, slot_mapping_map: torch.Tensor) -> None:
+    def reorder_kv_caches(self, slot_mapping_map: torch.Tensor | None) -> None:
+        if slot_mapping_map is None:
+            return
         for layer_index in sorted(self.index2name.keys()):
             layer_name = self.index2name[layer_index][0]
             kv_cache = self.kv_caches[layer_index]
