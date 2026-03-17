@@ -76,6 +76,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
@@ -419,6 +420,9 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_caches_dict: dict[str, torch.Tensor] = []
+        self.index2name = defaultdict(list)
+
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -5698,6 +5702,9 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+
+        for layer_name in kv_caches:
+            self.index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -5869,6 +5876,7 @@ class GPUModelRunner(
         return pinned.tolist()
 
     def reorder_kv_caches(self, slot_mapping_map: torch.Tensor) -> None:
-        for layer_name in self.slot_mappings:
-            kv_cache = self.kv_caches[layer_name]
+        for layer_index in sorted(self.index2name.keys()):
+            layer_name = self.index2name[layer_index][0]
+            kv_cache = self.kv_caches[layer_index]
             reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slot_mapping_map)
