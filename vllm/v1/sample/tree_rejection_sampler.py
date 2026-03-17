@@ -286,12 +286,12 @@ def tree_simple_validate(
     num_sampled_tokens = num_tokens_range[1:] - num_tokens_range[:-1]
 
     index = torch.arange(num_tokens, device=device, dtype=cu_num_sampled_tokens.dtype)
-    num_tokens_before = torch.repeat_interleave(
-        input=num_tokens_range[:batch_size],
+    index_delta = torch.repeat_interleave(
+        input=torch.arange(batch_size, dtype=index.dtype, device=device) * max_sampled_len - num_tokens_range[:batch_size],
         repeats=num_sampled_tokens,
         output_size=num_tokens,
     )
-    index -= num_tokens_before
+    index = index + index_delta 
 
     father_matrix = uncompress_to_matrix(
         input=tree_father,
@@ -316,7 +316,7 @@ def tree_simple_validate(
         max_num=max_sampled_len,
         val=-1,
     )
-    
+
     accepted_length = torch.zeros(
         (batch_size, max_sampled_len),
         dtype=torch.int32, device=device,
@@ -327,12 +327,13 @@ def tree_simple_validate(
         now_token = key_token_matrix[:, i]
         father_sampled = sampled_token_matrix.gather(1, father.unsqueeze(1).clamp(0)).squeeze(1)
         accepted = now_token == father_sampled
+
         father_accepted_length = accepted_length.gather(1, father.unsqueeze(1).clamp(0)).squeeze(1)
         father_accepted_length = torch.where(
             father != -1, father_accepted_length, 0
         )
         now_accepted_length = torch.where(
-            accepted & (father_accepted_length > 0)
+            accepted & (father_accepted_length > 0), father_accepted_length + 1, 0
         )
         accepted_length[:, i] = now_accepted_length
 
@@ -361,21 +362,28 @@ def tree_simple_validate(
     )
     tree_next_token_matrix = logits_indices_matrix.clone()
     curr_idx = longest_idx.unsqueeze(1)
-    new_pos = now_accepted_length - 1
+    new_pos = (now_accepted_length - 1).unsqueeze(1)
     for i in range(max_sampled_len):
         output_ids.scatter_(
-            1, curr_idx, sampled_token_matrix.gather(1, curr_idx)
+            1, curr_idx.clamp(0), torch.where(
+                curr_idx >= 0,
+                sampled_token_matrix.gather(1, curr_idx.clamp(0)),
+                output_ids[:, :1])
         )
+
         slot_mapping_map_matrix.scatter_(
-            1, curr_idx, new_pos
+            1, curr_idx.clamp(0), new_pos.clamp(0)
         )
-        father = father_matrix.gather(1, curr_idx).clamp(0)
+        father = father_matrix.gather(1, curr_idx.clamp(0))
         tree_next_token_matrix.scatter_(
-            1, father, logits_indices_matrix.gather(1, curr_idx)
+            1, father.clamp(0), torch.where(
+                father >= 0,
+                logits_indices_matrix.gather(1, curr_idx.clamp(0)),
+                tree_next_token_matrix[:, :1])
         )
 
         curr_idx = father
-        new_pos = (new_pos - 1).clamp(0)
+        new_pos = new_pos - 1
         
     tree_next_token_indices = tree_next_token_matrix.view(-1)[index].contiguous()
     slot_mapping_map = slot_mapping_map_matrix.view(-1)[index].contiguous()
@@ -385,7 +393,6 @@ def tree_simple_validate(
         tree_next_token_indices,
         tree_last_token_indices,
     )
-
 
 def test_tree_simple_validate():
     """Test the tree_simple_validate function.
