@@ -132,13 +132,13 @@ class TreeSimpleValidator(RejectionSampler):
             #     final_slots_mapping,
             # )
             pass
-        print(f"{metadata.key_token_ids=}\n"
-              f"{sampled_token_ids=}\n"
-              f"{slot_mapping_map=}\n"
-              f"{tree_next_token_indices=}\n"
-              f"{tree_last_token_indices}\n"
-              , end="", flush=True,
-        )
+        # print(f"{metadata.key_token_ids=}\n"
+        #       f"{sampled_token_ids=}\n"
+        #       f"{slot_mapping_map=}\n"
+        #       f"{tree_next_token_indices=}\n"
+        #       f"{tree_last_token_indices}\n"
+        #       , end="", flush=True,
+        # )
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
@@ -292,6 +292,11 @@ def tree_simple_validate(
         output_size=num_tokens,
     )
     index = index + index_delta 
+    slot_mapping_map_delta = torch.repeat_interleave(
+        input=num_tokens_range[:batch_size],
+        repeats=num_sampled_tokens,
+        output_size=num_tokens,
+    )
 
     father_matrix = uncompress_to_matrix(
         input=tree_father,
@@ -386,7 +391,7 @@ def tree_simple_validate(
         new_pos = new_pos - 1
         
     tree_next_token_indices = tree_next_token_matrix.view(-1)[index].contiguous()
-    slot_mapping_map = slot_mapping_map_matrix.view(-1)[index].contiguous()
+    slot_mapping_map = slot_mapping_map_matrix.view(-1)[index] + slot_mapping_map_delta
     return (
         output_ids,
         slot_mapping_map,
