@@ -314,6 +314,7 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    logits_indices: torch.Tensor
 
 
 class GPUModelRunner(
@@ -3463,6 +3464,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            logits_indices,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3499,6 +3501,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            logits_indices,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -3529,6 +3532,7 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     sampler_output,
+                    logits_indices,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -3735,6 +3739,7 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         sampler_output: SamplerOutput,
+        logits_indices: torch.Tensor,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -3887,7 +3892,7 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 tree_next_token_index=sampler_output.tree_next_token_indices,
                 tree_last_token_indices=sampler_output.tree_last_token_indices,
-                logits_indices=spec_decode_metadata.logits_indices,
+                logits_indices=logits_indices,
             )
 
         return draft_token_ids
