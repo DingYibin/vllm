@@ -132,7 +132,13 @@ class TreeSimpleValidator(RejectionSampler):
             #     final_slots_mapping,
             # )
             pass
-
+        print(f"{metadata.key_token_ids=}\n"
+              f"{sampled_token_ids=}\n"
+              f"{slot_mapping_map=}\n"
+              f"{tree_next_token_indices=}\n"
+              f"{tree_last_token_indices}\n"
+              , end="", flush=True,
+        )
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
@@ -233,7 +239,7 @@ def tree_simple_validate(
     cu_num_sampled_tokens,
     tree_father,
     max_sampled_len,
-) -> torch.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Perform tree-based rejection sampling via Triton kernel.
 
     This function prepares input tensors and launches the kernel for each
