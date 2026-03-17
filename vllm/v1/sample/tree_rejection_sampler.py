@@ -232,13 +232,29 @@ def apply_sampling_constraints(
     # which is slow for large vocab sizes. This may cause performance issues.
     return apply_top_k_top_p(logits, top_k, top_p)
 
+def uncompress_to_matrix(
+    input: torch.Tensor,
+    index: torch.Tensor,
+    batch_size: int,
+    max_num: int,
+    val,
+) -> torch.Tensor:
+    dtype = input.dtype
+    device = input.device
+    output = torch.full(
+        (batch_size, max_num), val,
+        dtype=dtype, device=device,
+    )
+    output.view(-1)[index] = input
+    return output
+
 def tree_simple_validate(
-    logits_indices,
-    key_token_ids,
-    sampled_token_ids,
-    cu_num_sampled_tokens,
-    tree_father,
-    max_sampled_len,
+    logits_indices: torch.Tensor,
+    key_token_ids: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    cu_num_sampled_tokens: torch.Tensor,
+    tree_father: torch.Tensor,
+    max_sampled_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Perform tree-based rejection sampling via Triton kernel.
 
@@ -268,72 +284,101 @@ def tree_simple_validate(
                                    device=device)
     num_tokens_range[1:] = cu_num_sampled_tokens
     num_sampled_tokens = num_tokens_range[1:] - num_tokens_range[:-1]
-    parent_idx = torch.repeat_interleave(
+
+    index = torch.arange(num_tokens, device=device, dtype=cu_num_sampled_tokens.dtype)
+    num_tokens_before = torch.repeat_interleave(
         input=num_tokens_range[:batch_size],
         repeats=num_sampled_tokens,
         output_size=num_tokens,
     )
-    parent_idx = torch.where(tree_father == -1,
-                             parent_idx,
-                             parent_idx + tree_father)
-    parent_sample_token_ids = sampled_token_ids[parent_idx]
-    accepted = key_token_ids == parent_sample_token_ids
+    index -= num_tokens_before
+
+    father_matrix = uncompress_to_matrix(
+        input=tree_father,
+        index=index,
+        batch_size=batch_size,
+        max_num=max_sampled_len,
+        val=-1,
+    )
+
+    key_token_matrix = uncompress_to_matrix(
+        input=key_token_ids,
+        index=index,
+        batch_size=batch_size,
+        max_num=max_sampled_len,
+        val=-1,
+    )
+
+    sampled_token_matrix = uncompress_to_matrix(
+        input=sampled_token_ids,
+        index=index,
+        batch_size=batch_size,
+        max_num=max_sampled_len,
+        val=-1,
+    )
+    
     accepted_length = torch.zeros(
         (batch_size, max_sampled_len),
-        dtype=torch.int32,
-        device=device,
+        dtype=torch.int32, device=device,
     )
-    accepted_length[:, 0] = 1 
+    accepted_length[:, 0] = 1
     for i in range(1, max_sampled_len):
-        now_loc = num_tokens_range[:batch_size] + i
-        now_mask = now_loc < num_tokens_range[1:]
-        now_parent = parent_idx[now_loc]
-        update_length = accepted[now_loc] & now_mask
-        parent_length = accepted_length[now_parent]
-        update_length = (parent_length > 0) & update_length
-        accepted_length[:, i] = torch.where(
-            update_length,
-            parent_length + 1,
-            0
+        father = father_matrix[:, i]
+        now_token = key_token_matrix[:, i]
+        father_sampled = sampled_token_matrix.gather(1, father.unsqueeze(1).clamp(0)).squeeze(1)
+        accepted = now_token == father_sampled
+        father_accepted_length = accepted_length.gather(1, father.unsqueeze(1).clamp(0)).squeeze(1)
+        father_accepted_length = torch.where(
+            father != -1, father_accepted_length, 0
         )
+        now_accepted_length = torch.where(
+            accepted & (father_accepted_length > 0)
+        )
+        accepted_length[:, i] = now_accepted_length
+
     now_accepted_length, longest_idx = accepted_length.max(dim=-1)
 
-    now_idx = longest_idx.unsqueeze(1)
-    now_loc = longest_idx + num_tokens_range[:batch_size]
-    now_indices = logits_indices[now_loc]
-    tree_last_token_indices = now_indices.clone()
-    tree_next_token_indices = logits_indices.clone()
+    tree_last_token_indices = logits_indices[
+        longest_idx + num_tokens_range[:batch_size]
+    ].clone()
+
     output_ids = torch.full(
         (batch_size, max_sampled_len), -1,
         dtype=torch.int32,
         device=device,
     )
-    slot_mapping_map = torch.full(
-        (num_tokens, ), -1,
-        dtype=torch.int32, device=device,
+    slot_mapping_map_matrix = torch.full(
+        (batch_size, max_sampled_len), -1,
+        dtype=torch.int32,
+        device=device,
     )
+    logits_indices_matrix = uncompress_to_matrix(
+        input=logits_indices,
+        index=index,
+        batch_size=batch_size,
+        max_num=max_sampled_len,
+        val=-1,
+    )
+    tree_next_token_matrix = logits_indices_matrix.clone()
+    curr_idx = longest_idx.unsqueeze(1)
+    new_pos = now_accepted_length - 1
     for i in range(max_sampled_len):
         output_ids.scatter_(
-            1, now_idx, sampled_token_ids[now_loc].unsqueeze(1)
+            1, curr_idx, sampled_token_matrix.gather(1, curr_idx)
         )
-        slot_mapping_map[now_loc] = torch.clamp(now_accepted_length, 0)
-        father = tree_father[now_loc]
-        father_loc = torch.where(
-            father != -1,
-            father + num_tokens_range[:batch_size],
-            num_tokens_range[:batch_size]
+        slot_mapping_map_matrix.scatter_(
+            1, curr_idx, new_pos
         )
-        tree_next_token_indices[father_loc] = torch.where(
-            father != -1,
-            now_indices,
-            tree_next_token_indices[father_loc],
+        father = father_matrix.gather(1, curr_idx).clamp(0)
+        tree_next_token_matrix.scatter_(
+            1, father, logits_indices_matrix.gather(1, curr_idx)
         )
-        now_idx = father.clamp(0)
-        now_loc = father_loc
-        now_indices = logits_indices[now_loc]
-        now_accepted_length = now_accepted_length - 1
-        
 
+        curr_idx = father
+        new_pos = (new_pos - 1).clamp(0)
+        
+    tree_next_token_indices = tree_next_token_matrix.view(-1)[index].contiguous()
+    slot_mapping_map = slot_mapping_map_matrix.view(-1)[index].contiguous()
     return (
         output_ids,
         slot_mapping_map,
