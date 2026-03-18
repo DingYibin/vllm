@@ -3894,6 +3894,7 @@ class GPUModelRunner(
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mapping_map=sampler_output.slot_mapping_map,
                 tree_next_token_indices=sampler_output.tree_next_token_indices,
                 tree_last_token_indices=sampler_output.tree_last_token_indices,
                 logits_indices=logits_indices,
