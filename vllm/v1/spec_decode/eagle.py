@@ -211,10 +211,33 @@ class EagleProposer:
             self.child_drafts_per_level.append(
                 num_drafts_per_level[level] // num_drafts_per_level[level - 1]
             )
+        print(f"{self.cu_drafts_per_level=}")
+        print(f"{self.child_drafts_per_level=}")
+        self.tree_father = None
+        self.node_level = None
+        self.all_kv_caches = None
+        if self.speculative_config.speculative_num_level is not None:
+            tree_father_list = [-1]
+            node_level_list = [0]
+            last_start = 0
+            last_end = 1
+            for i in range(self.speculative_config.speculative_num_level):
+                for j in range(last_start, last_end):
+                    tree_father_list.extend([j] * self.speculative_config.speculative_num_children_per_level)
+                    node_level_list.extend([i + 1] * self.speculative_config.speculative_num_children_per_level)
+                last_start = last_end
+                last_end = len(tree_father_list)
+            self.tree_father = torch.tensor(tree_father_list, dtype=torch.int32, device=device)
+            self.node_level = torch.tensor(node_level_list, dtype=torch.int32, device=device)
+        print(f"{self.tree_father=}")
+        print(f"{self.node_level=}")
+
         # Precompute draft position offsets in flattened tree.
         self.tree_draft_pos_offsets = torch.arange(
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
+
+        print(f"{self.tree_draft_pos_offsets=}")
 
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
@@ -242,6 +265,10 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mapping_map: torch.Tensor | None = None,
+        tree_next_token_indices: torch.Tensor | None = None,
+        tree_last_token_indices: torch.Tensor | None = None,
+        logits_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
@@ -258,6 +285,9 @@ class EagleProposer:
         # Shift the input ids by one token.
         # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
         self.input_ids[: num_tokens - 1] = target_token_ids[1:]
+        if tree_next_token_indices is not None and logits_indices is not None:
+            self.input_ids[logits_indices] = target_token_ids[tree_next_token_indices]
+            last_token_indices = tree_last_token_indices
         # Replace the last token with the next token.
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
         self.input_ids[last_token_indices] = next_token_ids
@@ -341,7 +371,7 @@ class EagleProposer:
                 hidden_states=self.hidden_states[:num_input_tokens],
                 inputs_embeds=inputs_embeds,
             )
-            if self.method == "mtp":
+            if not isinstance(ret_hidden_states, tuple):
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
             else:
@@ -369,6 +399,8 @@ class EagleProposer:
             hidden_states = hidden_states[last_token_indices]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
+            if self.runner is not None:
+                self.runner.reorder_kv_caches(slot_mapping_map, logits_indices)
             # Draft using tree attention.
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,

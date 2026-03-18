@@ -76,6 +76,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
@@ -114,6 +115,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
+from vllm.v1.attention.ops.triton_reorder_kv_cache import reorder_kv_cache
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -147,6 +149,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.tree_rejection_sampler import TreeSimpleValidator
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -312,6 +315,7 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    logits_indices: torch.Tensor
 
 
 class GPUModelRunner(
@@ -416,6 +420,9 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_caches_dict: dict[str, torch.Tensor] = []
+        self.index2name = defaultdict(list)
+
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -455,6 +462,7 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+            self.tree_validator = TreeSimpleValidator(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -684,6 +692,18 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+        self.printed = False
+        # Slot mapping for KV cache reordering after tree speculation acceptance.
+        # Set by the sampler when tree speculation is used, consumed by reorder_kv_caches().
+        self.slot_mapping_map = None
+        self.slot_mappings = None
+        self.tree_father = None
+        self.node_level = None
+        if hasattr(self, "drafter") and hasattr(self.drafter, "tree_father"):
+            self.tree_father = self.drafter.tree_father
+        if hasattr(self, "drafter") and hasattr(self.drafter, "node_level"):
+            self.node_level = self.drafter.node_level
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1538,9 +1558,19 @@ class GPUModelRunner(
                     >= self.input_batch.num_prompt_tokens[req_idx]
                 ):
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
-            )
+            
+            if self.tree_father is None:
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_tokens, cu_num_tokens
+                )
+            else:
+                spec_decode_metadata = self._calc_tree_spec_decode_metadata(
+                    num_draft_tokens, cu_num_tokens
+                )
+                self.positions.gpu[spec_decode_metadata.logits_indices] = (
+                    self.positions.gpu[spec_decode_metadata.root_indices]
+                    + spec_decode_metadata.node_level
+                )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -1589,8 +1619,10 @@ class GPUModelRunner(
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
         attn_metadata: PerLayerAttnMetadata = {}
+        self.slot_mappings = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
+            self.slot_mappings = [dict() for _ in range(len(ubatch_slices))]
 
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
@@ -1739,12 +1771,15 @@ class GPUModelRunner(
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
+                slots_mapping_dict = self.slot_mappings
             else:
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
+                slots_mapping_dict = self.slot_mappings[ubid]
 
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
+                slots_mapping_dict[layer_name] = attn_metadata_i.slot_mapping
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -2117,6 +2152,79 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+        )
+
+    def _calc_tree_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+    ) -> SpecDecodeMetadata:
+        # Inputs:
+        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
+        # num_draft_tokens:         [  3,   0,   2,   0,   1]
+        # Outputs:
+        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]
+        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,
+        #                            206, 207, 208]
+        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
+        # bonus_logits_indices:     [  3,   4,   7,   8,  10]
+
+        # Compute the logits indices.
+        # [4, 1, 3, 1, 2]
+        num_sampled_tokens = num_draft_tokens + 1
+
+        # Step 1. cu_num_sampled_tokens: [4, 5, 8, 9, 11]
+        # arange: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
+        cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(
+            num_sampled_tokens, cumsum_dtype=np.int32
+        )
+
+        tree_father = self.tree_father[arange]
+        node_level = self.node_level[arange]
+
+        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
+        root_indices = np.repeat(
+            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+        )
+        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
+        logits_indices = root_indices + arange
+
+        # Compute the draft logits indices.
+        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
+        # arange: [0, 1, 2, 0, 1, 0]
+        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
+            num_draft_tokens, cumsum_dtype=np.int32
+        )
+
+        # TODO: Optimize the CPU -> GPU copy.
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
+            self.device, non_blocking=True
+        )
+        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
+            self.device, non_blocking=True
+        )
+        logits_indices = torch.from_numpy(logits_indices).to(
+            self.device, non_blocking=True
+        )
+
+        key_token_ids = self.input_ids.gpu[logits_indices]
+        
+        root_indices = torch.from_numpy(root_indices).to(
+            self.device, non_blocking=True
+        )
+
+        return SpecDecodeMetadata(
+            draft_token_ids=None,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            cu_num_sampled_tokens=cu_num_sampled_tokens,
+            target_logits_indices=None,
+            bonus_logits_indices=None,
+            logits_indices=logits_indices,
+            key_token_ids=key_token_ids,
+            root_indices=root_indices,
+            tree_father=tree_father,
+            node_level=node_level,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -2744,13 +2852,21 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+        if spec_decode_metadata.is_tree_mode:
+            sampler_output = self.tree_validator(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
+        else:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
+        self.slot_mapping_map = sampler_output.slot_mapping_map
         return sampler_output
 
     def _bookkeeping_sync(
@@ -3365,6 +3481,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            logits_indices,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3401,6 +3518,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            logits_indices,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -3430,6 +3548,8 @@ class GPUModelRunner(
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    sampler_output,
+                    logits_indices,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -3635,6 +3755,8 @@ class GPUModelRunner(
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
+        sampler_output: SamplerOutput,
+        logits_indices: torch.Tensor,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -3785,6 +3907,10 @@ class GPUModelRunner(
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mapping_map=sampler_output.slot_mapping_map,
+                tree_next_token_indices=sampler_output.tree_next_token_indices,
+                tree_last_token_indices=sampler_output.tree_last_token_indices,
+                logits_indices=logits_indices,
             )
 
         return draft_token_ids
@@ -5590,6 +5716,9 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+
+        for layer_name in kv_caches:
+            self.index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -5759,3 +5888,16 @@ class GPUModelRunner(
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
+
+    def reorder_kv_caches(
+        self,
+        slot_mapping_map: torch.Tensor | None,
+        logits_indices: torch.Tensor,
+    ) -> None:
+        if slot_mapping_map is None:
+            return
+        for layer_index in sorted(self.index2name.keys()):
+            layer_name = self.index2name[layer_index][0]
+            kv_cache = self.kv_caches[layer_index]
+            slot_mapping = self.slot_mappings[layer_name][logits_indices]
+            reorder_kv_cache(kv_cache[0], kv_cache[1], slot_mapping, slot_mapping_map)
