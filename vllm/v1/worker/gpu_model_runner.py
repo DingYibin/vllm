@@ -697,10 +697,13 @@ class GPUModelRunner(
         # Slot mapping for KV cache reordering after tree speculation acceptance.
         # Set by the sampler when tree speculation is used, consumed by reorder_kv_caches().
         self.slot_mapping_map = None
-        self.slot_mapping = None
+        self.slot_mappings = None
         self.tree_father = None
+        self.node_level = None
         if hasattr(self, "drafter") and hasattr(self.drafter, "tree_father"):
             self.tree_father = self.drafter.tree_father
+        if hasattr(self, "drafter") and hasattr(self.drafter, "node_level"):
+            self.node_level = self.drafter.node_level
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1564,6 +1567,10 @@ class GPUModelRunner(
                 spec_decode_metadata = self._calc_tree_spec_decode_metadata(
                     num_draft_tokens, cu_num_tokens
                 )
+                self.positions.gpu[spec_decode_metadata.logits_indices] = (
+                    self.positions.gpu[spec_decode_metadata.root_indices]
+                    + spec_decode_metadata.node_level
+                )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -2173,14 +2180,14 @@ class GPUModelRunner(
         )
 
         tree_father = self.tree_father[arange]
+        node_level = self.node_level[arange]
 
         # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
-        logits_indices = np.repeat(
+        root_indices = np.repeat(
             cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
         )
         # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
-        logits_indices += arange
-
+        logits_indices = root_indices + arange
 
         # Compute the draft logits indices.
         # cu_num_draft_tokens: [3, 3, 5, 5, 6]
@@ -2201,6 +2208,10 @@ class GPUModelRunner(
         )
 
         key_token_ids = self.input_ids.gpu[logits_indices]
+        
+        root_indices = torch.from_numpy(root_indices).to(
+            self.device, non_blocking=True
+        )
 
         return SpecDecodeMetadata(
             draft_token_ids=None,
@@ -2211,7 +2222,9 @@ class GPUModelRunner(
             bonus_logits_indices=None,
             logits_indices=logits_indices,
             key_token_ids=key_token_ids,
+            root_indices=root_indices,
             tree_father=tree_father,
+            node_level=node_level,
         )
 
     def _prepare_kv_sharing_fast_prefill(

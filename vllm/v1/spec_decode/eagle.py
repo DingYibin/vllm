@@ -214,20 +214,23 @@ class EagleProposer:
         print(f"{self.cu_drafts_per_level=}")
         print(f"{self.child_drafts_per_level=}")
         self.tree_father = None
+        self.node_level = None
         self.all_kv_caches = None
         if self.speculative_config.speculative_num_level is not None:
-            self.tree_father = [-1]
+            tree_father_list = [-1]
+            node_level_list = [0]
             last_start = 0
             last_end = 1
             for i in range(self.speculative_config.speculative_num_level):
                 for j in range(last_start, last_end):
-                    self.tree_father.extend([j] * self.speculative_config.speculative_num_children_per_level)
+                    tree_father_list.extend([j] * self.speculative_config.speculative_num_children_per_level)
+                    node_level_list.extend([i] * self.speculative_config.speculative_num_children_per_level)
                 last_start = last_end
-                last_end = len(self.tree_father)
-            self.tree_father = torch.tensor(self.tree_father, dtype=torch.int32, device=device)
+                last_end = len(tree_father_list)
+            self.tree_father = torch.tensor(tree_father_list, dtype=torch.int32, device=device)
+            self.node_level = torch.tensor(node_level_list, dtype=torch.int32, device=device)
         print(f"{self.tree_father=}")
-
-            
+        print(f"{self.node_level=}")
 
         # Precompute draft position offsets in flattened tree.
         self.tree_draft_pos_offsets = torch.arange(

@@ -53,10 +53,13 @@ class SpecDecodeMetadata:
 
     key_token_ids: torch.Tensor | None = None
 
+    root_indices: torch.Tensor | None = None
     # [num_tree_nodes] Parent index for each tree node.
     # -1 indicates the root node (no parent).
     # Used to propagate rejection from parent to children.
     tree_father: torch.Tensor | None = None
+
+    node_level: torch.Tensor | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
