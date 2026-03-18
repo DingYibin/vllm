@@ -5876,10 +5876,15 @@ class GPUModelRunner(
         self.transfer_event.synchronize()
         return pinned.tolist()
 
-    def reorder_kv_caches(self, slot_mapping_map: torch.Tensor | None) -> None:
+    def reorder_kv_caches(
+        self,
+        slot_mapping_map: torch.Tensor | None,
+        logits_indices: torch.Tensor,
+    ) -> None:
         if slot_mapping_map is None:
             return
         for layer_index in sorted(self.index2name.keys()):
             layer_name = self.index2name[layer_index][0]
             kv_cache = self.kv_caches[layer_index]
-            reorder_kv_cache(kv_cache[0], kv_cache[1], self.slot_mappings[layer_name], slot_mapping_map)
+            slot_mapping = self.slot_mappings[layer_name][logits_indices]
+            reorder_kv_cache(kv_cache[0], kv_cache[1], slot_mapping, slot_mapping_map)

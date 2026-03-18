@@ -397,7 +397,7 @@ class EagleProposer:
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
             if self.runner is not None:
-                self.runner.reorder_kv_caches(slot_mapping_map)
+                self.runner.reorder_kv_caches(slot_mapping_map, logits_indices)
             # Draft using tree attention.
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
