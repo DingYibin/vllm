@@ -224,7 +224,7 @@ class EagleProposer:
             for i in range(self.speculative_config.speculative_num_level):
                 for j in range(last_start, last_end):
                     tree_father_list.extend([j] * self.speculative_config.speculative_num_children_per_level)
-                    node_level_list.extend([i] * self.speculative_config.speculative_num_children_per_level)
+                    node_level_list.extend([i + 1] * self.speculative_config.speculative_num_children_per_level)
                 last_start = last_end
                 last_end = len(tree_father_list)
             self.tree_father = torch.tensor(tree_father_list, dtype=torch.int32, device=device)
