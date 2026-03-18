@@ -391,7 +391,12 @@ def tree_simple_validate(
         new_pos = new_pos - 1
         
     tree_next_token_indices = tree_next_token_matrix.view(-1)[index].contiguous()
-    slot_mapping_map = slot_mapping_map_matrix.view(-1)[index] + slot_mapping_map_delta
+    slot_mapping_map = slot_mapping_map_matrix.view(-1)[index]
+    slot_mapping_map = torch.where(
+        slot_mapping_map != -1,
+        slot_mapping_map + slot_mapping_map_delta,
+        -1,
+    )
     return (
         output_ids,
         slot_mapping_map,
