@@ -211,6 +211,11 @@ class EagleProposer:
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
 
+        self.n_predict = getattr(
+            self.draft_model_config.hf_config, "n_predict", 1
+        )
+        logger.info(f"n_predict = {self.n_predict}, num_speculative_tokens = {self.num_speculative_tokens}.")
+
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
@@ -221,6 +226,66 @@ class EagleProposer:
             self.mrope_positions[:, :num_tokens] = positions
         else:
             self.positions[:num_tokens] = positions
+
+    def propose_multi_mtp(
+        self,
+        num_tokens,
+        first_mtp_input_ids,
+        first_mtp_draft_token_ids,
+        first_mtp_hidden_states,
+        last_token_indices,
+        per_layer_attn_metadata,
+        num_input_tokens,
+        num_tokens_across_dp,
+        cudagraph_runtime_mode,
+        mm_embed_inputs,
+    ) -> torch.Tensor:
+        last_input_ids = first_mtp_input_ids
+        last_sample_token_ids = first_mtp_draft_token_ids
+        last_hidden_states = first_mtp_hidden_states
+        draft_token_ids_list = [first_mtp_draft_token_ids]
+        for token_index in range(1, self.num_speculative_tokens):
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+            ):
+                self.input_ids[: num_tokens] = last_input_ids.roll(-1)
+                self.input_ids[last_token_indices] = last_sample_token_ids
+                last_input_ids = self.input_ids[: num_tokens]
+
+                if self.supports_mm_inputs:
+                    mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+                    self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                        self.input_ids[:num_tokens],
+                        multimodal_embeddings=mm_embeds,
+                        is_multimodal=is_mm_embed,
+                    )
+
+                    input_ids = None
+                    inputs_embeds = self.inputs_embeds[:num_input_tokens]
+                else:
+                    input_ids = self.input_ids[:num_input_tokens]
+                    inputs_embeds = None
+
+                self.hidden_states[:num_tokens] = last_hidden_states
+
+                last_hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=self._get_positions(num_input_tokens),
+                    hidden_states=self.hidden_states[:num_input_tokens],
+                    inputs_embeds=inputs_embeds,
+                    spec_step_idx=token_index,
+                )
+
+                sample_hidden_states = last_hidden_states[last_token_indices]
+                logits = self.model.compute_logits(sample_hidden_states, spec_step_idx=token_index)
+                last_sample_token_ids = logits.argmax(dim=-1).int()
+                draft_token_ids_list.append(last_sample_token_ids)
+
+        return draft_token_ids_list
 
     def propose(
         self,
@@ -348,6 +413,25 @@ class EagleProposer:
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
+
+        if (not isinstance(attn_metadata, TreeAttentionMetadata)
+            and self.method == "mtp"
+            and self.num_speculative_tokens <= self.n_predict
+        ):
+            draft_token_ids = logits.argmax(dim=-1).int()
+            draft_token_ids_list = self.propose_multi_mtp(
+                num_tokens,
+                self.input_ids[: num_tokens],
+                draft_token_ids,
+                last_hidden_states,
+                last_token_indices,
+                per_layer_attn_metadata,
+                num_input_tokens,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                mm_embed_inputs,
+            )
+            return torch.stack(draft_token_ids_list, dim=1)
 
         if self.uses_mrope:
             positions = target_positions[:, last_token_indices]

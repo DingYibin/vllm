@@ -435,6 +435,7 @@ _SPECULATIVE_DECODING_MODELS = {
     ),
     "EagleDeepSeekMTPModel": ("deepseek_eagle", "EagleDeepseekV3ForCausalLM"),
     "DeepSeekMTPModel": ("deepseek_mtp", "DeepSeekMTP"),
+    "Qwen2MTPModel": ("qwen2_mtp", "Qwen2MTP"),
     "ErnieMTPModel": ("ernie_mtp", "ErnieMTP"),
     "LongCatFlashMTPModel": ("longcat_flash_mtp", "LongCatFlashMTP"),
     "Glm4MoeMTPModel": ("glm4_moe_mtp", "Glm4MoeMTP"),
